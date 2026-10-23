@@ -30,7 +30,8 @@ sides hold the same rows under it, which is no change. Nothing is written withou
 
 Exit codes: 0 a plan was made and no rail tripped, 1 a rail refused the plan, 2 a file could
 not be read or written, 3 an input was refused (blank key, truncated or error response, too
-few source rows), 64 usage error, 70 an unexpected crash, which is never a finding.
+few source rows), 4 the only thing left is held-back duplicate keys, so the published copy is
+not known to match, 64 usage error, 70 an unexpected crash, which is never a finding.
 """
 
 import argparse
@@ -274,6 +275,11 @@ def verdict(plan, problems):
     if problems:
         return 1, "VERDICT: REFUSED, %d rail(s) tripped. Do not apply this plan." % len(problems)
     changes = len(plan["inserts"]) + len(plan["updates"]) + len(plan["deletes"])
+    if not changes and plan["held"]:
+        # Nothing to write, but the tool could not plan these keys, so it cannot call the
+        # published copy in step. Exit 0 here would read as clean to a scheduled job.
+        return 4, ("VERDICT: HELD BACK, %d duplicate key(s) left as published, a person "
+                   "decides. Nothing else to write." % len(plan["held"]))
     if not changes:
         return 0, "VERDICT: NO CHANGE, nothing to write."
     return 0, "VERDICT: PLAN READY, %d update(s), %d insert(s), %d delete(s), %d held back." % (
@@ -333,8 +339,8 @@ def read_features(path):
             raise InputRefused("%s is not valid JSON: %s" % (path, exc))
     if not isinstance(doc, dict) or isinstance(doc.get("error"), dict):
         raise InputRefused(
-            "%s is an error response or not a feature set. A failed query carries an error "
-            "object in the JSON body, whatever the HTTP status was." % path)
+            "%s is an error response or not a feature set. A file with an error object holds "
+            "no rows to plan from." % path)
     if doc.get("exceededTransferLimit") is True:
         raise InputRefused(
             "%s has exceededTransferLimit true, so it holds only the first page. Planning from "
@@ -712,6 +718,10 @@ def _self_test(tmp):
     plan = classify(rows(("dup", "x"), ("dup", "x")), rows(("dup", "x"), ("dup", "y")), ["V"])
     check(len(plan["held"]) == 1 and plan["duplicate_identical"] == 0,
           "same row count but different rows under a duplicated key is held back")
+    plan = classify(rows(("d", "1"), ("d", "2")), rows(("d", "3"), ("d", "4")), ["V"])
+    check(len(plan["held"]) == 1 and plan["duplicate_identical"] == 0,
+          "a duplicated key whose rows all differ between the sides is held back, not no "
+          "change  <-- pinned defect")
     plan = classify(rows(("n", "1"), ("n", "2")), rows(("z", "1")), ["V"])
     check([h["key"] for h in plan["held"]] == [["n"]] and plan["deletes"] == [["z"]]
           and not plan["inserts"],
@@ -751,6 +761,11 @@ def _self_test(tmp):
         return guard(p, False, 0.10, 0.02, 50)
 
     check(rails() == [], "a plan with no change trips no rail")
+    check("(2% of 1000 target rows)" in rails(deletes=[["k"]] * 21)[0]
+          and "(10% of 1000 target rows)" in rails(updates=[{}] * 101)[0],
+          "a rail message names the percent and the target size it was figured from")
+    check(guard(dict(big, target_rows=0, shared_keys=0, inserts=[["k"]]), False, 1.0, 1.0, 50)
+          == [], "an empty target counts as one row, so one insert fits a ceiling of 100%")
     check(rails(deletes=[["k"]] * 20) == [] and len(rails(deletes=[["k"]] * 21)) == 1,
           "deletes at exactly 2% pass and one more trips the delete rail")
     check(len(rails(updates=[{}] * 101)) == 1 and rails(updates=[{}] * 100) == [],
@@ -777,8 +792,21 @@ def _self_test(tmp):
     # ---- verdict and report
     check(verdict(big, ["x"])[0] == 1 and "REFUSED" in verdict(big, ["x"])[1],
           "a tripped rail gives exit 1")
-    check(verdict(dict(big), [])[1] == "VERDICT: NO CHANGE, nothing to write.",
+    check(verdict(dict(big), []) == (0, "VERDICT: NO CHANGE, nothing to write."),
           "a plan with no change says so")
+    ready = [verdict(dict(big, inserts=i, updates=u, deletes=d), [])
+             for i, u, d in (([["a"]], [], []), ([], [{}], []), ([], [], [["a"]]),
+                             ([["a"]], [{}], []))]
+    check(all(code == 0 and text.startswith("VERDICT: PLAN READY") for code, text in ready),
+          "an insert alone, an update alone, a delete alone and an insert with an update "
+          "each make a plan  <-- pinned defect")
+    stuck = verdict(dict(big, held=[{}]), [])
+    check(stuck[0] == 4 and stuck[1].startswith("VERDICT: HELD BACK, 1 duplicate key(s)")
+          and "NO CHANGE" not in stuck[1],
+          "a plan with only held keys is not called no change and exits 4  <-- pinned defect")
+    check(verdict(dict(big, held=[{}], updates=[{}]), [])[0] == 0
+          and verdict(dict(big, held=[{}]), ["x"])[0] == 1,
+          "held keys beside a change still give a plan, and a tripped rail still wins")
     plan = classify(rows(("a", "1"), ("b", "2"), ("c", "3")),
                     rows(("a", "1"), ("b", "9"), ("d", "4")), ["V"])
     check(verdict(plan, [])[0] == 0 and "1 update(s), 1 insert(s), 1 delete(s)" in verdict(plan, [])[1],
@@ -792,6 +820,11 @@ def _self_test(tmp):
           "a long list is cut at --sample and says how many it left out")
     text = "\n".join(describe(many, ["V"], ["K"], 0))
     check("inserts:" in text and "k00" not in text, "--sample 0 lists no key")
+    text = "\n".join(describe(many, ["V"], ["K"], 5))
+    check("... and" not in text and "k04" in text,
+          "a list exactly as long as --sample is not cut")
+    check("deletes:" not in text and "held back, a person" not in text,
+          "a heading with no key under it is not printed")
     held = classify(rows(("d", "1"), ("d", "2")), [], ["V"])
     check("source r0, r1, target none" in "\n".join(describe(held, ["V"], ["K"], 5)),
           "a held key is listed with the rows of each side")
@@ -853,6 +886,12 @@ def _self_test(tmp):
            "a key column the file does not hold is a usage error")
     raises(lambda: check_columns([], ["K"], [], "source"),
            "a file with no header is a usage error")
+    message = []
+    try:
+        check_columns([], ["K"], [], "source")
+    except ValueError as exc:
+        message.append(str(exc))
+    check(message and "(no columns at all)" in message[0], "and it says the file has no columns")
     raises(lambda: check_columns(["K"], ["K"], ["Z"], "target"),
            "an --ignore column the file does not hold is a usage error")
     check(check_columns(["K", "Z"], ["K"], ["Z"], "target") is None,
@@ -875,6 +914,14 @@ def _self_test(tmp):
     check(len(texts) == 1 and "7 row(s) on the target side" in texts[0]
           and "line 6, ..." in texts[0] and "line 7" not in texts[0],
           "a blank key lists the first five lines and a count")
+    for count, tail in ((5, False), (6, True)):
+        texts = []
+        try:
+            to_records([("line %d" % i, {"K": ""}) for i in range(2, 2 + count)], ["K"], "t")
+        except InputRefused as exc:
+            texts.append(str(exc))
+        check(len(texts) == 1 and (", ..." in texts[0]) == tail,
+              "%d blank keys %s the list" % (count, "cut" if tail else "do not cut"))
     texts = []
     try:
         to_records([("line 2", {"A": "1", "B": ""})], ["A", "B"], "source")
@@ -922,6 +969,12 @@ def _self_test(tmp):
     bad(["--key", "K", "--apply"], "--apply needs --out", "--apply without --out is refused")
     check(option_error(_parse(["a.csv", "b.csv", "--key", "K"])) is None,
           "a plain run has no usage error")
+    edge = ["a.csv", "b.csv", "--key", "K"]
+    check(all(option_error(_parse(edge + [flag, value])) is None for flag, value in (
+        ("--sample", "0"), ("--min-rows", "0"), ("--max-duplicates", "0"),
+        ("--max-change", "0"), ("--max-change", "1"), ("--max-delete", "0"),
+        ("--max-delete", "1"), ("--tolerance", "0"))),
+          "zero, and a fraction of exactly 1, are valid option values  <-- pinned defect")
 
     # ---- end to end through main, with real files
     src = make("src.csv", "SEG,NAME,LEN,EDITED\n" + "".join(
@@ -960,6 +1013,9 @@ def _self_test(tmp):
                             *loose, "--out", out])
     check(code == 0 and "Check only." in so and not os.path.exists(out),
           "without --apply nothing is written  <-- pinned defect")
+    code, so, se = run_cli([src, tgt2, "--key", "SEG", "--ignore", "EDITED"] + loose)
+    check(code == 0 and "not written" not in so and "Check only" not in so,
+          "with no --out the report says nothing about a plan file")
     code, so, se = run_cli([src, tgt2, "--key", "SEG", "--ignore", "EDITED",
                             *loose, "--out", out, "--ap"])
     check(code == 64 and "unrecognized arguments: --ap" in se and not os.path.exists(out),
@@ -967,7 +1023,8 @@ def _self_test(tmp):
     code, so, se = run_cli([src, tgt2, "--key", "SEG", "--ignore", "EDITED",
                             *loose, "--out", out,
                             "--apply"])
-    written = json.load(open(out, encoding="utf-8")) if os.path.exists(out) else {}
+    with open(out, encoding="utf-8") as handle:
+        written = json.load(handle)
     check(code == 0 and "wrote " in so and written.get("inserts") == [["S39"]],
           "--apply writes the plan file")
     check(written.get("updates") == [{"key": ["S05"], "columns": ["NAME"]}]
@@ -982,7 +1039,8 @@ def _self_test(tmp):
     big_out = os.path.join(tmp, "big.json")
     code, so, se = run_cli([src, tgt, "--key", "SEG", "--force-large", "--sample", "1",
                             "--out", big_out, "--apply"])
-    big_plan = json.load(open(big_out, encoding="utf-8"))
+    with open(big_out, encoding="utf-8") as handle:
+        big_plan = json.load(handle)
     check(code == 0 and "... and 39 more" in so and len(big_plan["updates"]) == 40,
           "--sample cuts the report and the plan file still lists every update")
     check(big_plan["refused"] == [] and big_plan["delta_rows_keyed"] == 80
@@ -1028,6 +1086,25 @@ def _self_test(tmp):
     check(code == 0 and "keyed delta" in so, "--help exits 0")
     code, so, se = run_cli([])
     check(code == 64 and "SOURCE and a TARGET" in se, "no arguments is exit 64")
+    code, so, se = run_cli([src, "--key", "SEG"])
+    check(code == 64 and "SOURCE and a TARGET" in se,
+          "a SOURCE with no TARGET is exit 64, not a crash  <-- pinned defect")
+
+    # ---- held keys and nothing else: the table is not known to be in step
+    hs = make("hs.csv", "ID,V\nA,1\nA,2\nB,3\n")
+    ht = make("ht.csv", "ID,V\nA,1\nB,3\n")
+    hout = os.path.join(tmp, "held.json")
+    code, so, se = run_cli([hs, ht, "--key", "ID", "--out", hout, "--apply"])
+    with open(hout, encoding="utf-8") as handle:
+        held_plan = json.load(handle)
+    check(code == 4 and "VERDICT: HELD BACK, 1 duplicate key(s)" in so and "NO CHANGE" not in so,
+          "only a held duplicate key gives exit 4 and says so, not NO CHANGE  <-- pinned defect")
+    check(held_plan["held"][0]["key"] == ["A"] and not held_plan["updates"],
+          "and the plan file still names the held key")
+    ws = make("ws.csv", "ID,V\nA,1\nA,2\n")
+    code, so, se = run_cli([ws, ws, "--key", "ID"])
+    check(code == 0 and "VERDICT: NO CHANGE" in so,
+          "the same duplicate rows on both sides are still no change and exit 0")
 
     # ---- the swapped-spelling case: every key differs between the sides
     lower = make("lower.csv", "SEG,NAME,LEN,EDITED\n" + "".join(
