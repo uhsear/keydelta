@@ -43,6 +43,7 @@ import io
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,12 @@ DEFAULT_MAX_DUPLICATES = 50
 DEFAULT_MIN_ROWS = 1
 DEFAULT_SAMPLE = 10
 PLAN_FORMAT = 1
+# The column a saved feature set's geometry is read into. No field name starts with @.
+GEOM_COL = "@geometry"
+# A plain decimal: no underscore, no space, no leading zero (02101 is a code, not 2101), no
+# hex, no nan or inf. float() alone accepts all of those.
+PLAIN_NUMBER = re.compile(r"[+-]?(0|[1-9][0-9]*)(\.[0-9]*)?([eE][+-]?[0-9]+)?\Z|"
+                          r"[+-]?\.[0-9]+([eE][+-]?[0-9]+)?\Z")
 
 
 class InputRefused(Exception):
@@ -83,11 +90,11 @@ def cell_text(value):
 
 
 def to_float(text):
-    """A finite float, or None. nan and inf are text, never a number to subtract."""
-    try:
-        number = float(text)
-    except ValueError:
+    """A finite float, or None. Only a plain decimal is a number. nan, inf, 1_0 and 007 are
+    text, never a number to subtract."""
+    if not PLAIN_NUMBER.match(text):
         return None
+    number = float(text)
     return number if math.isfinite(number) else None
 
 
@@ -102,6 +109,27 @@ def values_equal(a, b, tolerance):
     return False
 
 
+def _close(x, y, tolerance):
+    if isinstance(x, dict) and isinstance(y, dict):
+        return x.keys() == y.keys() and all(_close(x[k], y[k], tolerance) for k in x)
+    if isinstance(x, list) and isinstance(y, list):
+        return len(x) == len(y) and all(_close(p, q, tolerance) for p, q in zip(x, y))
+    if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (x, y)):
+        return math.isfinite(x) and math.isfinite(y) and abs(x - y) <= tolerance
+    return type(x) is type(y) and x == y
+
+
+def geometry_equal(a, b, tolerance):
+    """Two geometry texts that differ as text: equal when the shapes match and every number
+    is within tolerance. At tolerance 0 the text must match, so this is False."""
+    if tolerance <= 0:
+        return False
+    try:
+        return _close(json.loads(a), json.loads(b), tolerance)
+    except ValueError:
+        return False
+
+
 def differing(src_cells, tgt_cells, columns, tolerance):
     """(changed columns, noisy). noisy: some cell differs as text but sits inside tolerance."""
     changed = []
@@ -110,7 +138,8 @@ def differing(src_cells, tgt_cells, columns, tolerance):
         a, b = src_cells[col], tgt_cells[col]
         if a == b:
             continue
-        if values_equal(a, b, tolerance):
+        same = geometry_equal if col == GEOM_COL else values_equal
+        if same(a, b, tolerance):
             noisy = True
         else:
             changed.append(col)
@@ -150,7 +179,7 @@ def classify(src_records, tgt_records, columns, tolerance=0.0):
     src = group_by_key(src_records)
     tgt = group_by_key(tgt_records)
     plan = {"inserts": [], "updates": [], "deletes": [], "held": [],
-            "suppressed": [], "unchanged": 0, "duplicate_identical": 0,
+            "suppressed": [], "held_rows": 0, "unchanged": 0, "duplicate_identical": 0,
             "shared_keys": 0, "source_rows": len(src_records),
             "target_rows": len(tgt_records)}
     for key in sorted(set(src) | set(tgt)):
@@ -161,6 +190,7 @@ def classify(src_records, tgt_records, columns, tolerance=0.0):
             if same_rows(s_group, t_group, columns, tolerance):
                 plan["duplicate_identical"] += 1
             else:
+                plan["held_rows"] += len(s_group) + len(t_group)
                 plan["held"].append({
                     "key": list(key),
                     "source": [r[0] for r in s_group],
@@ -199,6 +229,14 @@ def guard(plan, force_large, max_change, max_delete, max_duplicates):
             "%d keys are held back as duplicates, above the ceiling of %d. Normal is a few; "
             "this many is systemic and would leave that many rows stale. --force-large does "
             "not override this." % (len(plan["held"]), max_duplicates))
+    rows_read = plan["source_rows"] + plan["target_rows"]
+    held_ceiling = int(rows_read * max_change)
+    if plan["held_rows"] > held_ceiling:
+        problems.append(
+            "%d rows sit under the held-back duplicate keys, above the ceiling of %d (%.0f%% of "
+            "the %d rows read). The key column is probably not a key, and this plan would "
+            "compare few of the rows. --force-large does not override this." % (
+                plan["held_rows"], held_ceiling, max_change * 100, rows_read))
     if force_large:
         return problems
     if plan["source_rows"] and plan["target_rows"] and not plan["shared_keys"]:
@@ -207,19 +245,21 @@ def guard(plan, force_large, max_change, max_delete, max_duplicates):
             "row inserted. That is the delete-all this tool exists to avoid. The key columns "
             "probably spell the key differently on the two sides.")
     denominator = max(plan["target_rows"], 1)
+    basis = ("%d target rows" % plan["target_rows"] if plan["target_rows"]
+             else "0 target rows, counted as 1")
     delete_ceiling = int(denominator * max_delete)
     if len(plan["deletes"]) > delete_ceiling:
         problems.append(
-            "%d deletes exceeds the ceiling of %d (%.0f%% of %d target rows). A bad source "
+            "%d deletes exceeds the ceiling of %d (%.0f%% of %s). A bad source "
             "read must not empty the target. Rerun with --force-large if the deletion is "
-            "intended." % (len(plan["deletes"]), delete_ceiling, max_delete * 100, denominator))
+            "intended." % (len(plan["deletes"]), delete_ceiling, max_delete * 100, basis))
     total = len(plan["inserts"]) + len(plan["updates"]) + len(plan["deletes"])
     change_ceiling = int(denominator * max_change)
     if total > change_ceiling:
         problems.append(
-            "%d changed rows exceeds the ceiling of %d (%.0f%% of %d target rows). That is "
+            "%d changed rows exceeds the ceiling of %d (%.0f%% of %s). That is "
             "more likely a bad read than real editing. Rerun with --force-large if it is "
-            "intended." % (total, change_ceiling, max_change * 100, denominator))
+            "intended." % (total, change_ceiling, max_change * 100, basis))
     return problems
 
 
@@ -267,6 +307,7 @@ def describe(plan, columns, keys, sample):
         key_label(u["key"]), ", ".join(u["columns"])))
     section("inserts:", plan["inserts"], key_label)
     section("deletes:", plan["deletes"], key_label)
+    section("noise inside tolerance, not rewritten:", plan["suppressed"], key_label)
     return lines
 
 
@@ -303,6 +344,7 @@ def plan_document(plan, keys, columns, problems):
         "updates": plan["updates"],
         "deletes": plan["deletes"],
         "held": plan["held"],
+        "suppressed": plan["suppressed"],
     }
 
 
@@ -314,7 +356,8 @@ def read_csv(path):
     """(header, [(where, cells dict)]). where names the line a record starts on."""
     records = []
     with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
-        reader = csv.reader(handle)
+        # strict: an unclosed quote is an error, not one cell that swallows the rest of the file.
+        reader = csv.reader(handle, strict=True)
         header = next(reader, [])
         while True:
             start = reader.line_num + 1
@@ -332,7 +375,7 @@ def read_csv(path):
 
 def read_features(path):
     """(header, [(where, cells dict)]) from a saved feature set response (f=json)."""
-    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
         try:
             doc = json.load(handle)
         except ValueError as exc:
@@ -348,16 +391,22 @@ def read_features(path):
     features = doc.get("features")
     if not isinstance(features, list):
         raise InputRefused("%s has no features list." % path)
+    # Geometry is compared, as one text column, when any feature carries the key. A moved
+    # shape with the same attributes is a change, not NO CHANGE.
+    with_geometry = any(isinstance(f, dict) and "geometry" in f for f in features)
     header = []
     records = []
     for i, feature in enumerate(features):
         attrs = feature.get("attributes") if isinstance(feature, dict) else None
         if not isinstance(attrs, dict):
             raise InputRefused("%s: feature %d has no attributes." % (path, i + 1))
-        for name in attrs:
+        cells = {k: cell_text(v) for k, v in attrs.items()}
+        if with_geometry:
+            cells[GEOM_COL] = cell_text(feature.get("geometry"))
+        for name in cells:
             if name not in header:
                 header.append(name)
-        records.append(("feature %d" % (i + 1), {k: cell_text(v) for k, v in attrs.items()}))
+        records.append(("feature %d" % (i + 1), cells))
     for _, cells in records:
         for name in header:
             cells.setdefault(name, "")
@@ -373,7 +422,9 @@ def load(path):
 
 def check_columns(header, keys, ignore, side):
     """Raise ValueError for a column the flags name that the file does not hold."""
-    absent = [c for c in list(keys) + list(ignore) if c not in header]
+    # --ignore @geometry is allowed on a file that has no geometry column, so a CSV can be
+    # compared with a feature set.
+    absent = [c for c in list(keys) + list(ignore) if c not in header and c != GEOM_COL]
     if absent:
         raise ValueError("%s: columns not in the file: %s. It has: %s" % (
             side, ", ".join(absent), ", ".join(header) if header else "(no columns at all)"))
@@ -415,10 +466,10 @@ def build_plan(src_path, tgt_path, keys, ignore, tolerance, min_rows):
     """Read both snapshots and classify. Raises ValueError, InputRefused, OSError, csv.Error."""
     src_header, src_raw = load(src_path)
     tgt_header, tgt_raw = load(tgt_path)
+    check_min_rows(len(src_raw), min_rows)
     check_columns(src_header, keys, ignore, "source")
     check_columns(tgt_header, keys, ignore, "target")
     columns = compare_columns(src_header, tgt_header, keys, ignore)
-    check_min_rows(len(src_raw), min_rows)
     src = to_records(src_raw, keys, "source")
     tgt = to_records(tgt_raw, keys, "target")
     return classify(src, tgt, columns, tolerance), columns
@@ -658,6 +709,33 @@ def _self_test(tmp):
           "to_float reads a number and refuses text")
     check(to_float("nan") is None and to_float("inf") is None and to_float("-Infinity") is None,
           "nan and inf are text, never a number to subtract  <-- pinned defect")
+    check(to_float("02101") is None and to_float("007") is None and to_float("00.5") is None,
+          "a code with a leading zero is text, not a number  <-- pinned defect")
+    check(to_float("1_0") is None and to_float(" 10") is None and to_float("0x10") is None
+          and to_float("") is None and to_float("1e") is None,
+          "underscore, padded, hex and empty text are not numbers  <-- pinned defect")
+    check([to_float(t) for t in ("0", "-0.5", "+3", "5.", ".5", "1e3", "10.5E-1", "0.25")]
+          == [0.0, -0.5, 3.0, 5.0, 0.5, 1000.0, 1.05, 0.25] and to_float("1e999") is None,
+          "plain decimals read as numbers and an overflow is text")
+    check(not values_equal("02101", "2101", 0.5) and not values_equal("007", "7", 0.5)
+          and not values_equal("1_0", "10", 0.5),
+          "a tolerance never makes a leading-zero or underscore code equal to a number  "
+          "<-- pinned defect")
+    shape = '{"paths": [[[0, 0], [100, 100]]]}'
+    check(geometry_equal(shape, '{"paths": [[[0.001, 0], [100, 99.999]]]}', 0.01)
+          and not geometry_equal(shape, '{"paths": [[[0, 0], [1, 1]]]}', 0.01),
+          "a shape inside the tolerance is equal and a moved one is not")
+    check(not geometry_equal(shape, '{"paths": [[[0.001, 0], [100, 100]]]}', 0),
+          "at tolerance 0 the geometry text must match")
+    check(not geometry_equal('{"a": 1}', '{"b": 1}', 1) and not geometry_equal("[1]", "[1, 2]", 1)
+          and not geometry_equal("[true]", "[1]", 1) and not geometry_equal("[1]", "[NaN]", 1)
+          and not geometry_equal("", "[1]", 1) and not geometry_equal('"a"', '"b"', 1)
+          and geometry_equal('{"a": "x", "b": [1]}', '{"b": [1.5], "a": "x"}', 1),
+          "different keys, lengths, types, nan, blank and text never pass a geometry tolerance")
+    changed, noisy = differing({"@geometry": "[1]"}, {"@geometry": "[1.001]"}, ["@geometry"], 0.1)
+    check(changed == [] and noisy, "geometry noise is counted as noise, like a number")
+    changed, noisy = differing({"@geometry": "[1]"}, {"@geometry": "[2]"}, ["@geometry"], 0.1)
+    check(changed == ["@geometry"] and not noisy, "a moved shape is a changed column")
     check(values_equal("a", "a", 0) and not values_equal("1.0", "1", 0),
           "with no tolerance the comparison is exact text")
     check(values_equal("1.0", "1", 0.01), "1.0 and 1 are equal inside a tolerance")
@@ -752,8 +830,8 @@ def _self_test(tmp):
           "1 insert + 2 for the update + 1 delete is 4 delta rows against 3 + 3 for delete-all")
 
     # ---- guard
-    big = {"inserts": [], "updates": [], "deletes": [], "held": [], "shared_keys": 1000,
-           "source_rows": 1000, "target_rows": 1000}
+    big = {"inserts": [], "updates": [], "deletes": [], "held": [], "held_rows": 0,
+           "shared_keys": 1000, "source_rows": 1000, "target_rows": 1000}
 
     def rails(**over):
         p = dict(big)
@@ -786,6 +864,18 @@ def _self_test(tmp):
     check(len(guard(dict(big, target_rows=0, shared_keys=0, inserts=[["k"]] * 5), False,
                     0.1, 0.02, 50)) == 1,
           "loading an empty target needs --force-large, the ceiling cannot divide by zero")
+    check(guard(dict(big, target_rows=0, shared_keys=0, inserts=[["k"]] * 2), False,
+                1.0, 1.0, 50)[0].startswith("2 changed rows exceeds the ceiling of 1 (100% of 0 "
+                                            "target rows, counted as 1)"),
+          "an empty target counts as one row, so two inserts trip a ceiling of 100%, and the "
+          "message says the target had 0 rows")
+    wrong = rails(held_rows=201, held=[{}] * 3, source_rows=1000, target_rows=1000)
+    check(len(wrong) == 1 and "201 rows sit under the held-back duplicate keys" in wrong[0]
+          and "above the ceiling of 200 (10% of the 2000 rows read)" in wrong[0] and rails(held_rows=200) == [],
+          "rows under held keys above 10% of the rows read are refused, 200 of 2000 pass  "
+          "<-- pinned defect")
+    check(len(guard(dict(big, held_rows=500), True, 0.1, 0.02, 50)) == 1,
+          "--force-large does not lift the held-rows rail")
     raises(lambda: check_min_rows(0, 1), "an empty source is refused", InputRefused)
     check(check_min_rows(1, 1) is None, "a source at the floor passes")
 
@@ -828,6 +918,13 @@ def _self_test(tmp):
     held = classify(rows(("d", "1"), ("d", "2")), [], ["V"])
     check("source r0, r1, target none" in "\n".join(describe(held, ["V"], ["K"], 5)),
           "a held key is listed with the rows of each side")
+    noisy_plan = classify(rows(("a", "10.000000001"), ("b", "1")),
+                          rows(("a", "10.0"), ("b", "1")), ["V"], 0.01)
+    text = "\n".join(describe(noisy_plan, ["V"], ["K"], 10))
+    check("noise inside tolerance, not rewritten:\n  a" in text
+          and plan_document(noisy_plan, ["K"], ["V"], [])["suppressed"] == [["a"]],
+          "a key suppressed by the tolerance is listed in the report and the plan file  "
+          "<-- pinned defect")
     doc = plan_document(plan, ["K"], ["V"], [])
     check(doc["delta_rows_keyed"] == 4 and doc["delta_rows_delete_all"] == 6
           and doc["format"] == 1 and json.loads(json.dumps(doc)) == doc,
@@ -844,6 +941,9 @@ def _self_test(tmp):
           "a short row reads its missing cell as blank")
     check(read_csv(make("empty.csv", "")) == ([], []), "an empty file has no header and no rows")
     check(read_csv(make("hdr.csv", "K,V\n"))[1] == [], "a header-only file has no rows")
+    raises(lambda: read_csv(make("open.csv", 'K,V\n1,a\n2,"b\n3,c\n4,d\n')),
+           "a quote that never closes is an error, not one cell that eats the file  "
+           "<-- pinned defect", csv.Error)
     raises(lambda: read_csv(make("huge.csv", "K\n" + "x" * 200000 + "\n")),
            "a field over the csv limit raises csv.Error", csv.Error)
     raises(lambda: read_csv(os.path.join(tmp, "missing.csv")),
@@ -854,6 +954,17 @@ def _self_test(tmp):
     check(header == ["K", "V", "W"] and raw[0][1] == {"K": "1", "V": "", "W": ""}
           and raw[1][1]["W"] == "true" and raw[1][0] == "feature 2",
           "a feature set reads attributes, fills a missing one with blank, and names the feature")
+    bom_header, bom_raw = read_features(make("bom.json", "\ufeff" + json.dumps(good)))
+    check(bom_header == ["K", "V", "W"] and len(bom_raw) == 2,
+          "a feature set saved with a UTF-8 byte order mark is read  <-- pinned defect")
+    geo = {"features": [{"attributes": {"K": 1}, "geometry": {"x": 1, "y": 2}},
+                        {"attributes": {"K": 2}, "geometry": None},
+                        {"attributes": {"K": 3}}]}
+    header, raw = read_features(make("geo.json", json.dumps(geo)))
+    check(header == ["K", "@geometry"] and raw[0][1]["@geometry"] == '{"x": 1, "y": 2}'
+          and raw[1][1]["@geometry"] == "" and raw[2][1]["@geometry"] == "",
+          "a feature set with geometry reads it into one text column, blank when missing  "
+          "<-- pinned defect")
     cases = [
         ("bad.json", "{not json", "is not valid JSON", "text that is not JSON"),
         ("err.json", '{"error": {"code": 400, "message": "x"}}', "error response",
@@ -896,6 +1007,8 @@ def _self_test(tmp):
            "an --ignore column the file does not hold is a usage error")
     check(check_columns(["K", "Z"], ["K"], ["Z"], "target") is None,
           "columns that exist pass")
+    check(check_columns(["K", "A"], ["K"], ["@geometry"], "target") is None,
+          "--ignore @geometry passes on a file with no geometry column")
     check(compare_columns(["K", "A", "B"], ["K", "B", "A"], ["K"], []) == ["A", "B"],
           "column order does not matter")
     check(compare_columns(["K", "A", "T"], ["K", "A", "U"], ["K"], ["T", "U"]) == ["A"],
@@ -965,6 +1078,7 @@ def _self_test(tmp):
     bad(["--key", "K", "--max-duplicates", "-1"], "--max-duplicates",
         "a negative duplicate ceiling is refused")
     bad(["--key", "K", "--max-change", "1.5"], "--max-change", "a change fraction above 1 is refused")
+    bad(["--key", "K", "--max-delete", "2"], "--max-delete", "a delete fraction above 1 is refused")
     bad(["--key", "K", "--max-delete", "-0.1"], "--max-delete", "a negative delete fraction is refused")
     bad(["--key", "K", "--apply"], "--apply needs --out", "--apply without --out is refused")
     check(option_error(_parse(["a.csv", "b.csv", "--key", "K"])) is None,
@@ -1091,8 +1205,9 @@ def _self_test(tmp):
           "a SOURCE with no TARGET is exit 64, not a crash  <-- pinned defect")
 
     # ---- held keys and nothing else: the table is not known to be in step
-    hs = make("hs.csv", "ID,V\nA,1\nA,2\nB,3\n")
-    ht = make("ht.csv", "ID,V\nA,1\nB,3\n")
+    pad = "".join("B%02d,%d\n" % (i, i) for i in range(20))
+    hs = make("hs.csv", "ID,V\nA,1\nA,2\n" + pad)
+    ht = make("ht.csv", "ID,V\nA,1\n" + pad)
     hout = os.path.join(tmp, "held.json")
     code, so, se = run_cli([hs, ht, "--key", "ID", "--out", hout, "--apply"])
     with open(hout, encoding="utf-8") as handle:
@@ -1128,6 +1243,100 @@ def _self_test(tmp):
     code, so, se = run_cli([noisy_s, noisy_t, "--key", "SEG", "--tolerance", "0.01"])
     check(code == 0 and "NO CHANGE" in so and "noise inside tolerance, no change      1" in so,
           "tolerance turns a 1e-9 difference into a counted no-change")
+
+    # ---- geometry, codes under a tolerance, an empty feature set, a key that is not a key
+    def feature_file(name, shapes):
+        doc = {"features": [{"attributes": {"ID": k, "V": "a"}, "geometry": g}
+                            for k, g in shapes]}
+        return make(name, json.dumps(doc))
+
+    g1 = feature_file("g1.json", [("1", {"x": 1, "y": 2}), ("2", {"x": 5, "y": 5})])
+    g2 = feature_file("g2.json", [("1", {"x": 500, "y": 900}), ("2", {"x": 5, "y": 5})])
+    code, so, se = run_cli([g1, g2, "--key", "ID", "--max-change", "0.6"])
+    check(code == 0 and "update       1" in so and "  1  columns @geometry" in so,
+          "a feature that moved with the same attributes is an update, not NO CHANGE  "
+          "<-- pinned defect")
+    code, so, se = run_cli([g1, g2, "--key", "ID", "--tolerance", "0.5"])
+    check("update       1" in so, "and a tolerance of 0.5 does not hide a move of hundreds")
+    g3 = feature_file("g3.json", [("1", {"x": 1.001, "y": 2}), ("2", {"x": 5, "y": 5})])
+    code, so, se = run_cli([g1, g3, "--key", "ID"])
+    check("update       1" in so, "a shape off by 0.001 is an update with no tolerance")
+    code, so, se = run_cli([g1, g3, "--key", "ID", "--tolerance", "0.01"])
+    check(code == 0 and "NO CHANGE" in so and "noise inside tolerance, no change      1" in so,
+          "and the same shape inside a tolerance of 0.01 is counted noise")
+    csv_t = make("gt.csv", "ID,V\n1,a\n2,a\n")
+    code, so, se = run_cli([g1, csv_t, "--key", "ID"])
+    check(code == 64 and "@geometry" in se and "--ignore" in se,
+          "a feature set with geometry against a CSV is refused until --ignore @geometry")
+    code, so, se = run_cli([g1, csv_t, "--key", "ID", "--ignore", "@geometry"])
+    check(code == 0 and "NO CHANGE" in so, "and --ignore @geometry compares the attributes only")
+    zs = make("zs.csv", "K,CODE,V\nA,02101,1\nB,5,2\n")
+    zt = make("zt.csv", "K,CODE,V\nA,2101,1\nB,5,2\n")
+    code, so, se = run_cli([zs, zt, "--key", "K", "--tolerance", "0.5", "--max-change", "0.6"])
+    check(code == 0 and "update       1" in so and "CODE" in so,
+          "02101 changed to 2101 is an update even with a tolerance  <-- pinned defect")
+    code, so, se = run_cli([make("empty.json", '{"features": [], "exceededTransferLimit": false}'),
+                            tgt, "--key", "SEG"])
+    check(code == 3 and "below --min-rows 1" in so,
+          "an empty feature set source is refused with exit 3, not a column error  "
+          "<-- pinned defect")
+    cyc = "".join("%s,%d\n" % ("AB"[i % 2], i) for i in range(40))
+    cyc_s = "".join("%s,%d\n" % ("AB"[i % 2], i + 5) for i in range(40))
+    code, so, se = run_cli([make("cs.csv", "CAT,V\n" + cyc_s + "C,1\n"),
+                            make("ct.csv", "CAT,V\n" + cyc), "--key", "CAT"])
+    check(code == 1 and "rows sit under the held-back duplicate keys" in so
+          and "VERDICT: REFUSED" in so,
+          "a key column that is not a key is refused, not a PLAN READY on one insert  "
+          "<-- pinned defect")
+
+    # ---- the README demo, rebuilt, so the quoted output is exercised
+    def seg(i, name=None, length=None, edited="2026-01-01"):
+        return "S%02d,%s,%s,%s\n" % (i, name or "Road %02d" % i, length or "%d.5" % (100 + i),
+                                     edited)
+
+    demo_head = "SEG_ID,NAME,LEN_FT,EDITED_ON\n"
+    demo_src = make("source.csv", demo_head + "".join(
+        seg(i, edited="2026-01-02") for i in range(1, 61)) + seg(21, "Road 21 b"))
+    demo_tgt_rows = [seg(i, "Road 7x" if i == 7 else None,
+                         "113.500000000001" if i == 13 else None) for i in range(1, 60)]
+    demo_tgt = make("target.csv", demo_head + "".join(demo_tgt_rows) + seg(99, "Gone", "1.5"))
+    demo = [demo_src, demo_tgt, "--key", "SEG_ID", "--ignore", "EDITED_ON"]
+    code, so, se = run_cli(demo)
+    check(code == 0 and so.splitlines()[0].endswith("61 row(s), %s 60 row(s)" % demo_tgt)
+          and "compared columns: 2\nrows planned:\n  unchanged    56\n  update       2\n"
+          "  insert       1\n  delete       1\n"
+          "  held back    1 (duplicate key, left as published)\n" in so,
+          "the README demo plans 56 unchanged, 2 updates, 1 insert, 1 delete, 1 held back")
+    check("keyed plan 6, delete-all plus insert-all 121" in so
+          and "held back, a person decides:\n  S21  source line 22, line 62, target line 22\n"
+          "\nupdates:\n  S07  columns NAME\n  S13  columns LEN_FT\n\ninserts:\n  S60\n"
+          "\ndeletes:\n  S99\n" in so
+          and so.endswith("VERDICT: PLAN READY, 2 update(s), 1 insert(s), 1 delete(s), "
+                          "1 held back.\n"),
+          "and the report prices it at 6 delta rows against 121 and lists each key")
+    code, so, se = run_cli(demo + ["--tolerance", "0.01", "--out", os.path.join(tmp, "d.json"),
+                                   "--apply"])
+    check(code == 0 and "  unchanged    57\n  update       1\n" in so
+          and "noise inside tolerance, no change      1\n" in so
+          and "keyed plan 4, delete-all plus insert-all 121" in so
+          and "noise inside tolerance, not rewritten:\n  S13\n" in so
+          and "wrote " in so and so.endswith("VERDICT: PLAN READY, 1 update(s), 1 insert(s), "
+                                            "1 delete(s), 1 held back.\n"),
+          "with --tolerance 0.01 S13 is noise, listed, and the plan file is written")
+    lower_rows = "".join(seg(i).lower() for i in range(1, 60)) + seg(99, "Gone", "1.5").lower()
+    lower_tgt = make("lower2.csv", demo_head + lower_rows)
+    code, so, se = run_cli([demo_src, lower_tgt, "--key", "SEG_ID", "--ignore", "EDITED_ON"])
+    check(code == 1 and "no key is on both sides" in so
+          and "60 deletes exceeds the ceiling of 1 (2% of 60 target rows)" in so
+          and "119 changed rows exceeds the ceiling of 6 (10% of 60 target rows)" in so
+          and "VERDICT: REFUSED, 3 rail(s) tripped. Do not apply this plan." in so,
+          "the README lower-case key case trips three rails")
+    page = make("page1.json", '{"features": [], "exceededTransferLimit": true}')
+    code, so, se = run_cli([page, demo_tgt, "--key", "SEG_ID", "--ignore", "EDITED_ON"])
+    check(code == 3 and so == "REFUSED   %s has exceededTransferLimit true, so it holds only "
+          "the first page. Planning from a partial source would delete every row it did not "
+          "return.\n\nVERDICT: REFUSED\n" % page,
+          "the README truncated-page output is exact")
 
     # ---- unexpected crash is 70, not 1
     original = globals()["build_plan"]
@@ -1176,8 +1385,20 @@ def _self_test(tmp):
     # ---- the tool opens no socket and writes only with --apply
     with open(script, "r", encoding="utf-8") as handle:
         code_text = handle.read()
-    check(not any(("import " + m) in code_text for m in ("socket", "urllib", "http", "ssl")),
+    def network_imports(text):
+        found = set()
+        for node in ast.walk(ast.parse(text)):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                names = [a.name for a in node.names] + [getattr(node, "module", None) or ""]
+                found.update(n.split(".")[0] for n in names)
+        return found & {"socket", "urllib", "http", "ssl", "requests", "ftplib", "smtplib"}
+
+    check(network_imports(code_text) == set(),
           "the source imports no network module")
+    check(network_imports("from urllib.request import urlopen") == {"urllib"}
+          and network_imports("import http.client") == {"http"}
+          and network_imports("import os") == set(),
+          "and the check sees the from form and a dotted import  <-- pinned defect")
     check(all(ord(ch) < 128 for ch in code_text), "the source is pure ASCII")
     check(not any(isinstance(n, ast.JoinedStr) for n in ast.walk(ast.parse(code_text))),
           "the source has no f-strings")
