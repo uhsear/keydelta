@@ -359,6 +359,13 @@ def read_csv(path):
         # strict: an unclosed quote is an error, not one cell that swallows the rest of the file.
         reader = csv.reader(handle, strict=True)
         header = next(reader, [])
+        # A repeated header name would keep only the last such column and compare the rest
+        # never, so a changed value could read as NO CHANGE. Refuse it.
+        repeated = sorted(set(n for n in header if header.count(n) > 1))
+        if repeated:
+            raise InputRefused(
+                "%s repeats the column name(s) %s, so the earlier column of each would never "
+                "be compared. Rename or drop the repeats first." % (path, ", ".join(repeated)))
         while True:
             start = reader.line_num + 1
             row = next(reader, None)
@@ -423,8 +430,9 @@ def load(path):
 def check_columns(header, keys, ignore, side):
     """Raise ValueError for a column the flags name that the file does not hold."""
     # --ignore @geometry is allowed on a file that has no geometry column, so a CSV can be
-    # compared with a feature set.
-    absent = [c for c in list(keys) + list(ignore) if c not in header and c != GEOM_COL]
+    # compared with a feature set. --key @geometry is not: a CSV has no such column to key on.
+    absent = [c for c in list(keys) if c not in header]
+    absent += [c for c in ignore if c not in header and c != GEOM_COL]
     if absent:
         raise ValueError("%s: columns not in the file: %s. It has: %s" % (
             side, ", ".join(absent), ", ".join(header) if header else "(no columns at all)"))
@@ -1185,9 +1193,17 @@ def _self_test(tmp):
     check(code == 0 and "delete       40" in so, "--min-rows 0 plans the deletion of the target")
     code, so, se = run_cli([make("blank.csv", "SEG,NAME,LEN,EDITED\n,x,1,2\n"), tgt, "--key", "SEG"])
     check(code == 3 and "blank key" in so, "a blank key is refused with exit 3, never skipped")
+    dup_src = make("dh.csv", "SEG,V,V\na,1,2\nb,1,2\n")
+    dup_tgt = make("dh2.csv", "SEG,V,V\na,9,2\nb,1,2\n")
+    code, so, se = run_cli([dup_src, dup_tgt, "--key", "SEG"])
+    check(code == 3 and "repeats the column name(s) V" in so,
+          "a repeated CSV header is refused, not read as NO CHANGE  <-- pinned defect")
     code, so, se = run_cli([make("p.json", '{"features": [], "exceededTransferLimit": true}'),
                             tgt, "--key", "SEG"])
     check(code == 3 and "first page" in so, "a truncated feature set is refused with exit 3")
+    code, so, se = run_cli([src, tgt, "--key", "@geometry"])
+    check(code == 64 and "columns not in the file: @geometry" in se,
+          "--key @geometry on a CSV is exit 64, not a crash  <-- pinned defect")
     code, so, se = run_cli([src, tgt, "--key", "NOPE"])
     check(code == 64 and "columns not in the file: NOPE" in se, "a wrong --key is exit 64")
     code, so, se = run_cli([os.path.join(tmp, "nope.csv"), tgt, "--key", "SEG"])

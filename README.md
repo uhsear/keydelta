@@ -45,6 +45,10 @@ PASS  two populated tables with no shared key are refused by name  <-- pinned de
 ...
 PASS  refused: a truncated first page  <-- pinned defect
 ...
+PASS  a repeated CSV header is refused, not read as NO CHANGE  <-- pinned defect
+...
+PASS  --key @geometry on a CSV is exit 64, not a crash  <-- pinned defect
+...
 PASS  --ap is refused, not read as a longer flag  <-- pinned defect
 ...
 PASS  --apply never replaces a plan file that exists, and the verdict still prints  <-- pinned defect
@@ -58,10 +62,10 @@ PASS  and raises() accepts the exception it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-147 assertions, 0 failed
+199 assertions, 0 failed
 ```
 
-The full run prints all 147 assertions. Each `...` line above is where this block is cut.
+The full run prints all 199 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -85,16 +89,17 @@ I did not run csvdiff or daff for this README. Their pages say nothing about a k
 share, so I make no claim about what they do with one. I also found no page that describes pricing
 the diff against the delete-all, or listing the rows a duplicate key held back. This tool adds
 those three things: the duplicate handling, the tolerance, and the refusals. A search of GitHub
-for the name `keydelta` on the day this was written found one unrelated repository, so the name
-is not taken by a tool for this.
+for the name `keydelta` on the day this was written found this repository and one unrelated
+one, a set of buttons, so the name is not taken by another tool for this.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Each snapshot is a CSV, or a saved feature set (`.json`) from a layer query.
 
-The self-test prints the same 147 assertions on Windows (Python 3.13.2), on Python 3.9.25 and
-on Ubuntu (Python 3.12.3). The three outputs are identical line for line.
+The self-test prints the same 199 assertions on Windows (Python 3.13.2), on Python 3.9.25 and
+on Ubuntu (Python 3.12.3). The three outputs are identical line for line once the Windows
+carriage returns are removed.
 `coverage run --branch keydelta.py --self-test` reports 100 percent of lines and branches.
 
 ```
@@ -123,10 +128,10 @@ python keydelta.py response.json target.csv --key SEG_ID
 | `--ignore` | none | A column to leave out of the comparison, such as an edit timestamp. Repeatable. |
 | `--tolerance` | `0` | Two numbers within this are equal. At `0` the comparison is exact text. |
 | `--min-rows` | `1` | Refuse a source with fewer rows than this. |
-| `--max-change` | `0.10` | Refuse more inserts, updates and deletes than this fraction of the target. |
+| `--max-change` | `0.10` | Refuse more inserts, updates and deletes than this fraction of the target. It also caps the rows under held-back keys, as a fraction of the rows read from both files. |
 | `--max-delete` | `0.02` | Refuse more deletes than this fraction of the target. |
 | `--max-duplicates` | `50` | Refuse more held-back duplicate keys than this. |
-| `--force-large` | off | Lift the change, delete and no-shared-key rails. Not the duplicate rail. |
+| `--force-large` | off | Lift the change, delete and no-shared-key rails. Not the two duplicate rails. |
 | `--sample` | `10` | How many keys to list under each heading. `0` lists none. |
 | `--out` | off | Path for the plan file, a new JSON file. Needs `--apply` to be written. |
 | `--apply` | off | Write `--out`. Without it nothing is written. |
@@ -136,6 +141,23 @@ Every flag must be spelled in full. The parser sets `allow_abbrev=False`, so `--
 with exit 64 instead of being read as `--apply`, and `--tol` is refused instead of being read as
 `--tolerance`. The self-test pins eleven prefixes, and one run through `main` that confirms
 `--ap` writes no file.
+
+**Geometry.** A saved feature set that carries a `geometry` for any feature gets one extra
+compared column, `@geometry`, holding the shape as JSON. A moved shape with the same attributes
+is an `update` of `@geometry`. `--tolerance` applies to every coordinate. A CSV has no such
+column, so comparing a feature set with geometry against a CSV exits 64 with `Only on one side:
+@geometry` until you add `--ignore @geometry`. Two feature sets that differ only in a shape:
+
+```
+$ python keydelta.py g1.json g2.json --key ID --max-change 1
+...
+updates:
+  1  columns @geometry
+
+VERDICT: PLAN READY, 1 update(s), 0 insert(s), 0 delete(s), 0 held back.
+```
+
+With `--tolerance 0.6`, a move of 0.5 in x is noise and the verdict is `NO CHANGE`.
 
 `--out` must name a new file. A path that is also an input is refused with exit 64, on a dry run
 too. A path that already exists is refused at write time with exit 2, because the file is opened
@@ -240,8 +262,11 @@ The tool refuses before it plans, and it refuses a plan it has made.
 
 **Input refusals, exit 3.** Each prints `REFUSED` and `VERDICT: REFUSED`.
 
-- A blank key, or a key that is only spaces, on either side. A row with no key would be inserted
-  and deleted on every run. The first five lines are named.
+- A blank key, or a key that is only spaces, on either side. For a composite key, one blank
+  part is enough. A row with no key would be inserted and deleted on every run. The first five
+  lines are named.
+- A CSV that repeats a column name. Only the last column of that name would be read, so a change
+  in the earlier one would show as `NO CHANGE`. The file is refused and the names are listed.
 - A source with fewer rows than `--min-rows`. An empty source plans to delete the target.
 - A feature set whose `exceededTransferLimit` is `true`. Esri's query documentation describes
   that property through paging: there are no more pages to fetch when it is `false`. A `true`
@@ -281,6 +306,11 @@ VERDICT: REFUSED, 3 rail(s) tripped. Do not apply this plan.
 - More held-back duplicate keys than `--max-duplicates` (default 50). A few is editors renumbering.
   Dozens means the key is not a key, and holding that many rows back would leave the published
   table stale. `--force-large` does not lift this one.
+- More rows under held-back keys than `--max-change` of the rows read from both files. The key
+  is probably not a key, and the plan would compare few of the rows. `--force-large` does not
+  lift this one either. On a very small table one duplicate key can trip it: 10 source rows
+  against 9 target rows with one duplicate key is refused, with `--force-large` too, as `3 rows
+  sit under the held-back duplicate keys, above the ceiling of 1`. Raise `--max-change`.
 
 `--force-large` lifts the delete, change and no-shared-key rails together. Use it for a first
 load into an empty target, which has no row to divide by, and for a bulk load you meant to make.
@@ -292,28 +322,47 @@ load into an empty target, which has no row to divide by, and for a bulk load yo
 | 0 | A plan was made and no rail tripped. A plan with no change is also 0. |
 | 1 | A rail refused the plan. |
 | 2 | A file could not be read or written. The verdict still prints when the write failed. |
-| 3 | An input was refused: blank key, too few source rows, truncated or error response. |
-| 64 | Usage error, including a bad column name and a flag prefix. |
+| 3 | An input was refused: blank key, repeated column name, too few source rows, truncated or error response. |
+| 4 | Only held-back duplicate keys are left, so the verdict is `HELD BACK`. The published copy is not known to match. |
+| 64 | Usage error, including a bad column name, a flag prefix, two files with different columns and a file with no columns. |
 | 70 | An unexpected crash in the tool. Never a finding about the data. |
+
+Exit 4 is the held-only case. Two tables of which the only difference is one key that the source
+holds twice:
+
+```
+$ python keydelta.py s2.csv t2.csv --key ID --max-change 1
+...
+held back, a person decides:
+  2  source line 3, line 4, target line 3
+
+VERDICT: HELD BACK, 1 duplicate key(s) left as published, a person decides. Nothing else to write.
+```
+
+A plan with changes and held-back keys, like the demo above, exits 0. Read the held back count.
 
 ## Limits
 
 - It plans and never applies. The plan file is for a person or a separate, reviewed job to carry
   out. There is no `--fix`, no SQL, no connection to a geodatabase and no edit session.
 - Keys are compared verbatim. Case, leading zeros, padding and punctuation are not normalised, and
-  the spaces inside a key count. Only a key that is entirely blank is refused. If the two sides
+  the spaces inside a key count. Only a key with a blank part is refused. If the two sides
   spell the key differently, the no-shared-key rail catches the whole-table case, and a partial
   mismatch shows up as inserts and deletes.
 - Cells are compared as text. `1.0` and `1` differ unless `--tolerance` is above 0. A NULL and an
   empty string both read as blank, so a change between them is not seen. A JSON number is
-  written with Python's `str` or `repr`.
+  written with Python's `str` or `repr`, so `5.0` or `1e16` in a feature set against `5` or
+  `10000000000000000` in a CSV is an `update` unless `--tolerance` is above 0. That errs on the
+  safe side.
 - The tolerance applies to every column that holds a finite number on both sides, not to named
   columns. `nan` and `inf` are text. The limit is inclusive in exact arithmetic but not in binary
   floating point: `1` against `1.01` at tolerance `0.01` is not equal, because the difference is
   0.010000000000000009. Set the tolerance a little above the noise you mean to hide.
-- Geometry is not read. A shape exported as one text column, such as WKT, is compared as text. To
-  use the tolerance on coordinates, export X and Y as separate numeric columns. The tolerance does
-  not test shape equality, and a buffer-containment test on real geometry is not part of this.
+- One `--tolerance` applies to every numeric column and every coordinate, in the units of each.
+  In degrees, `0.01` hides a move of about 1 km as noise. The same value applies to numbers inside
+  the geometry JSON, such as a `wkid`, and to code columns that look like numbers, so keep it well
+  below 1. A shape exported as one text column, such as WKT, is compared as text. The tolerance
+  does not test shape equality, and a buffer-containment test is not part of this.
 - A duplicated key is judged by its set of rows, matched one to one in order of appearance with the
   tolerance. It is greedy, so with a tolerance larger than the spacing of your values, a pairing
   can come out differently from the best one. Keep the tolerance small.
@@ -328,13 +377,45 @@ load into an empty target, which has no row to divide by, and for a bulk load yo
   `exceededTransferLimit`. A CSV cut off by a failed export looks like a smaller table, and the
   delete rail is what stops it.
 - Only UTF-8 CSV is supported. Other bytes are decoded lossily, so two different keys can
-  collapse into one. A short row reads its missing cells as blank and a long row has its extra
-  cells ignored. Duplicate header names are not detected. A UTF-8 byte order mark is removed.
+  collapse into one, and so can two different values. A CSV in cp1252, which Excel writes by
+  default, that changes `Caf` plus an acute `e` to `Caf` plus a grave `e` reports `NO CHANGE` with
+  exit 0. Save as UTF-8 first. A short row reads its missing cells as blank and a long row has its
+  extra cells ignored. A UTF-8 byte order mark is removed.
+- A CSV that starts with a blank line, uses semicolons or is UTF-16 exits 64, because the header
+  is not read as columns. A UTF-16 feature set is refused too. All are refused cleanly.
+- The parser takes two optional positional files. On Python 3.12 and older, `SOURCE --key K
+  TARGET` (an option between the files) exits 64 with `unrecognized arguments`. Python 3.13
+  accepts it. Put both files first.
+- A group of N rows under one key is compared in time that grows with N squared. With a
+  low-cardinality column as `--key` and the two files in different orders, 4000 rows under one
+  key took about 2 seconds here, and tens of thousands would run for minutes before any rail can
+  fire. Use a real key.
+- A JSON file nested hundreds of thousands of levels deep raises `RecursionError`, and a huge
+  integer in a shape can raise `OverflowError`. Both exit 70, a fault in the tool, not a finding.
+- If stdout is a closed pipe, such as a report piped to `head`, a `BrokenPipeError` can end the
+  run with exit 70. The exit code then reflects the pipe, not the data.
+- The report prints keys as they are and joins a composite key with `|`. A key that holds `|`
+  can make two keys print alike, and a key with a newline can print a line such as
+  `VERDICT: NO CHANGE` above the real verdict. The plan file keeps each key as a list. Read the
+  exit code, not one line of the report.
+- A plan with changes and held-back keys exits 0 and prints `PLAN READY`. It means the plan is
+  ready for the other rows. Exit 4 happens only when the held keys are all that is left. A job
+  that reads only the exit code should also read the held back count.
+- When the plan file cannot be written, the exit code is 2 but the output still ends with
+  `VERDICT: PLAN READY`. Trust the exit code.
+- Rail ceilings use `int(rows * fraction)` in floating point, so `--max-change 0.29` on 100 rows
+  gives 28, not 29. That errs on the strict side.
+- The `--out` same-file check uses the real path, which resolves symbolic links. A hard link to an
+  input is not detected. Exclusive creation still means an existing path is never overwritten.
+- The self-test writes its temporary files under the system temporary directory and removes
+  them on exit. Only `--apply` writes a plan file for a real run.
 - A character the console cannot show prints as `?` instead of stopping the run. The plan file is
   always UTF-8.
 - It reads both files into memory and has no streaming mode. One run of 300,000 synthetic rows a
   side, three columns each, took 3.5 seconds on a Windows workstation and 2.6 seconds on an
-  Ubuntu server. Memory was not measured. Your tables will differ.
+  Ubuntu server. A later run on the same workstation took between 4.5 and 4.6 seconds. The
+  self-test does not run this, and the figures are measurements, not a promise. Memory was not
+  measured. Your tables will differ.
 - A key that starts with `=`, `+`, `-` or `@` is written to the plan as it came. The plan is JSON,
   but a report pasted into a spreadsheet may read such a key as a formula.
 - The plan file is written in place with exclusive creation, not through a temporary file. A
@@ -342,6 +423,10 @@ load into an empty target, which has no row to divide by, and for a bulk load yo
 - No line is unreachable offline: coverage is 100 percent of lines and branches. The tool opens no
   socket and imports no network module, so it has no network path to stub and no credential in it
   to leak. The self-test asserts that its own source imports no network module.
+- A mutation sweep of 519 mutants, run on the revision before the last two fixes, of the code outside the self-test (flipped comparisons, `and`
+  and `or` swaps, forced branches, dropped statements, constants plus one) left 4 alive. They are
+  the `if __name__ == "__main__"` guard and `return _run(argv)` in `main`, each of which makes the
+  script do nothing so the self-test never starts. The self-test kills the other 515.
 - The self-test counts the same on all three interpreters. The cp1252 console assertion builds its
   own stream in memory, so it gives the same answer on a host whose console is UTF-8.
 - I read the Esri pages above for the behaviours this README relies on. I did not test the tool
