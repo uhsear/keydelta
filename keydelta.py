@@ -32,10 +32,11 @@ A key that two rows share is never planned: it is held back and left as publishe
 sides hold the same rows under it, which is no change. Nothing is written without --apply, and
 --apply writes one plan file.
 
-Exit codes: 0 a plan was made and no rail tripped, 1 a rail refused the plan, 2 a file could
-not be read or written, 3 an input was refused (blank key, truncated or error response, too
-few source rows), 4 the only thing left is held-back duplicate keys, so the published copy is
-not known to match, 64 usage error, 70 an unexpected crash, which is never a finding.
+Exit codes: 0 a plan was made, no rail tripped and no key was held back, 1 a rail refused the
+plan, 2 a file could not be read or written, 3 an input was refused (blank key, a row whose
+field count differs from the header, truncated or error response, too few source rows), 4 a
+duplicate key was held back, so the published copy is not known to match (the plan is still
+written under --apply), 64 usage error, 70 an unexpected crash, which is never a finding.
 """
 
 import argparse
@@ -382,8 +383,11 @@ def verdict(plan, problems):
                    "decides. Nothing else to write." % len(plan["held"]))
     if not changes:
         return 0, "VERDICT: NO CHANGE, nothing to write."
-    return 0, "VERDICT: PLAN READY, %d update(s), %d insert(s), %d delete(s), %d held back." % (
-        len(plan["updates"]), len(plan["inserts"]), len(plan["deletes"]), len(plan["held"]))
+    # Held keys beside changes exit 4 as well: the plan is complete for the other rows, but the
+    # published copy will still differ, and exit 0 would read as in step to a scheduled job.
+    return (4 if plan["held"] else 0), (
+        "VERDICT: PLAN READY, %d update(s), %d insert(s), %d delete(s), %d held back." % (
+            len(plan["updates"]), len(plan["inserts"]), len(plan["deletes"]), len(plan["held"])))
 
 
 def plan_document(plan, keys, columns, problems):
@@ -434,10 +438,14 @@ def read_csv(path):
                 break
             if not row:
                 continue
-            cells = {}
-            for i, name in enumerate(header):
-                cells[name] = row[i] if i < len(row) else ""
-            records.append(("line %d" % start, cells))
+            if len(row) != len(header):
+                # A cell beyond the header, or a missing one, is a row the tool cannot read
+                # as written. An unquoted comma would hide a real edit as NO CHANGE.
+                raise InputRefused(
+                    "%s line %d has %d field(s) but the header has %d. An unquoted comma or a "
+                    "cut-off row is the usual cause. Quote the field or fix the row first." % (
+                        path, start, len(row), len(header)))
+            records.append(("line %d" % start, dict(zip(header, row))))
     return header, records
 
 
@@ -996,9 +1004,12 @@ def _self_test(tmp):
     check(stuck[0] == 4 and stuck[1].startswith("VERDICT: HELD BACK, 1 duplicate key(s)")
           and "NO CHANGE" not in stuck[1],
           "a plan with only held keys is not called no change and exits 4  <-- pinned defect")
-    check(verdict(dict(big, held=[{}], updates=[{}]), [])[0] == 0
+    mixed = verdict(dict(big, held=[{}], updates=[{}]), [])
+    check(mixed[0] == 4 and mixed[1].startswith("VERDICT: PLAN READY, 1 update(s)")
+          and mixed[1].endswith("1 held back.")
           and verdict(dict(big, held=[{}]), ["x"])[0] == 1,
-          "held keys beside a change still give a plan, and a tripped rail still wins")
+          "held keys beside a change still give a plan but exit 4, and a tripped rail still "
+          "wins  <-- pinned defect")
     plan = classify(rows(("a", "1"), ("b", "2"), ("c", "3")),
                     rows(("a", "1"), ("b", "9"), ("d", "4")), ["V"])
     check(verdict(plan, [])[0] == 0 and "1 update(s), 1 insert(s), 1 delete(s)" in verdict(plan, [])[1],
@@ -1033,14 +1044,20 @@ def _self_test(tmp):
           "the plan document is plain JSON and carries both costs")
 
     # ---- readers
-    path = make("q.csv", "\ufeffK,V\r\n1,a\r\n\r\n2,\"multi\nline\"\r\n3,c\r\n4\r\n")
+    path = make("q.csv", "\ufeffK,V\r\n1,a\r\n\r\n2,\"multi\nline\"\r\n3,c\r\n4,\r\n")
     header, raw = read_csv(path)
     check(header == ["K", "V"], "a UTF-8 BOM does not become part of the first column name  "
           "<-- pinned defect")
     check([w for w, _ in raw] == ["line 2", "line 4", "line 6", "line 7"],
           "a blank line and a quoted newline do not move the reported line  <-- pinned defect")
     check(raw[3][1] == {"K": "4", "V": ""} and raw[1][1]["V"] == "multi\nline",
-          "a short row reads its missing cell as blank")
+          "an empty last cell reads as blank")
+    raises(lambda: read_csv(make("long.csv", "ID,NAME\n1,Main St, Apt 2\n")),
+           "a row with more fields than the header is refused, not read with its extra cells "
+           "dropped  <-- pinned defect", InputRefused)
+    raises(lambda: read_csv(make("short.csv", "ID,NAME\n1\n")),
+           "a row with fewer fields than the header is refused, not read as blank  "
+           "<-- pinned defect", InputRefused)
     check(read_csv(make("empty.csv", "")) == ([], []), "an empty file has no header and no rows")
     check(read_csv(make("hdr.csv", "K,V\n"))[1] == [], "a header-only file has no rows")
     raises(lambda: read_csv(make("open.csv", 'K,V\n1,a\n2,"b\n3,c\n4,d\n')),
@@ -1220,17 +1237,17 @@ def _self_test(tmp):
     check(code == 1 and "1 deletes exceeds the ceiling of 0" in so,
           "on a 41 row target one delete trips the 2% rail, which is 0 rows")
     code, so, se = run_cli([src, tgt2, "--key", "SEG", "--ignore", "EDITED"] + loose)
-    check(code == 0 and "update       1" in so and "insert       1" in so
+    check(code == 4 and "update       1" in so and "insert       1" in so
           and "delete       1" in so and "held back    1" in so,
-          "one update, one insert, one delete and one held duplicate plan together, exit 0")
+          "one update, one insert, one delete and one held duplicate plan together, exit 4  <-- pinned defect")
     check("S02  source line 3, target line 3, line 42" in so,
           "the held key names the lines of both files")
     code, so, se = run_cli([src, tgt2, "--key", "SEG", "--ignore", "EDITED",
                             *loose, "--out", out])
-    check(code == 0 and "Check only." in so and not os.path.exists(out),
+    check(code == 4 and "Check only." in so and not os.path.exists(out),
           "without --apply nothing is written  <-- pinned defect")
     code, so, se = run_cli([src, tgt2, "--key", "SEG", "--ignore", "EDITED"] + loose)
-    check(code == 0 and "not written" not in so and "Check only" not in so,
+    check(code == 4 and "not written" not in so and "Check only" not in so,
           "with no --out the report says nothing about a plan file")
     code, so, se = run_cli([src, tgt2, "--key", "SEG", "--ignore", "EDITED",
                             *loose, "--out", out, "--ap"])
@@ -1241,7 +1258,7 @@ def _self_test(tmp):
                             "--apply"])
     with open(out, encoding="utf-8") as handle:
         written = json.load(handle)
-    check(code == 0 and "wrote " in so and written.get("inserts") == [["S39"]],
+    check(code == 4 and "wrote " in so and written.get("inserts") == [["S39"]],
           "--apply writes the plan file")
     check(written.get("updates") == [{"key": ["S05"], "columns": ["NAME"]}]
           and written.get("deletes") == [["S99"]] and written.get("held")[0]["key"] == ["S02"],
@@ -1279,7 +1296,7 @@ def _self_test(tmp):
           and not os.path.exists(out2),
           "a refused plan writes no file even with --apply  <-- pinned defect")
     code, so, se = run_cli([src, tgt2, "--key", "SEG", "--ignore", "EDITED", "--force-large"])
-    check(code == 0, "--force-large lifts the change and delete rails")
+    check(code == 4, "--force-large lifts the change and delete rails")
     code, so, se = run_cli([make("e.csv", "SEG,NAME,LEN,EDITED\n"), tgt, "--key", "SEG"])
     check(code == 3 and "below --min-rows 1" in so, "an empty source is refused with exit 3")
     code, so, se = run_cli([make("e.csv", "SEG,NAME,LEN,EDITED\n"), tgt, "--key", "SEG",
@@ -1287,6 +1304,12 @@ def _self_test(tmp):
     check(code == 0 and "delete       40" in so, "--min-rows 0 plans the deletion of the target")
     code, so, se = run_cli([make("blank.csv", "SEG,NAME,LEN,EDITED\n,x,1,2\n"), tgt, "--key", "SEG"])
     check(code == 3 and "blank key" in so, "a blank key is refused with exit 3, never skipped")
+    pad = "".join("p%d,x" % k + "\n" for k in range(40))
+    code, so, se = run_cli([make("ucs.csv", "ID,NAME\n1,Main St, Apt 2\n" + pad),
+                            make("uct.csv", "ID,NAME\n1,Main St, Apt 3\n" + pad), "--key", "ID"])
+    check(code == 3 and "line 2 has 3 field(s) but the header has 2" in so
+          and "NO CHANGE" not in so,
+          "an unquoted comma is refused with exit 3, not read as NO CHANGE  <-- pinned defect")
     dup_src = make("dh.csv", "SEG,V,V\na,1,2\nb,1,2\n")
     dup_tgt = make("dh2.csv", "SEG,V,V\na,9,2\nb,1,2\n")
     code, so, se = run_cli([dup_src, dup_tgt, "--key", "SEG"])
@@ -1374,6 +1397,10 @@ def _self_test(tmp):
     code, so, se = run_cli([g1, g3, "--key", "ID", "--tolerance", "0.01"])
     check(code == 0 and "NO CHANGE" in so and "noise inside tolerance, no change      1" in so,
           "and the same shape inside a tolerance of 0.01 is counted noise")
+    g4 = feature_file("g4.json", [("1", {"x": 1.5, "y": 2}), ("2", {"x": 5, "y": 5})])
+    code, so, se = run_cli([g1, g4, "--key", "ID", "--tolerance", "0.6"])
+    check(code == 0 and "VERDICT: NO CHANGE" in so,
+          "a move of 0.5 in x is noise at a tolerance of 0.6")
     csv_t = make("gt.csv", "ID,V\n1,a\n2,a\n")
     code, so, se = run_cli([g1, csv_t, "--key", "ID"])
     check(code == 64 and "@geometry" in se and "--ignore" in se,
@@ -1568,7 +1595,7 @@ def _self_test(tmp):
     demo_tgt = make("target.csv", demo_head + "".join(demo_tgt_rows) + seg(99, "Gone", "1.5"))
     demo = [demo_src, demo_tgt, "--key", "SEG_ID", "--ignore", "EDITED_ON"]
     code, so, se = run_cli(demo)
-    check(code == 0 and so.splitlines()[0].endswith("61 row(s), %s 60 row(s)" % demo_tgt)
+    check(code == 4 and so.splitlines()[0].endswith("61 row(s), %s 60 row(s)" % demo_tgt)
           and "compared columns: 2\nrows planned:\n  unchanged    56\n  update       2\n"
           "  insert       1\n  delete       1\n"
           "  held back    1 (duplicate key, left as published)\n" in so,
@@ -1582,7 +1609,7 @@ def _self_test(tmp):
           "and the report prices it at 6 delta rows against 121 and lists each key")
     code, so, se = run_cli(demo + ["--tolerance", "0.01", "--out", os.path.join(tmp, "d.json"),
                                    "--apply"])
-    check(code == 0 and "  unchanged    57\n  update       1\n" in so
+    check(code == 4 and "  unchanged    57\n  update       1\n" in so
           and "noise inside tolerance, no change      1\n" in so
           and "keyed plan 4, delete-all plus insert-all 121" in so
           and "noise inside tolerance, not rewritten:\n  S13\n" in so
@@ -1641,8 +1668,8 @@ def _self_test(tmp):
     done = subprocess.run([sys.executable, script, src, tgt2, "--key", "SEG", "--ignore",
                            "EDITED", "--force-large"], stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, universal_newlines=True)
-    check(done.returncode == 0 and "VERDICT: PLAN READY" in done.stdout,
-          "the script runs as a process and exits 0 on a ready plan")
+    check(done.returncode == 4 and "VERDICT: PLAN READY" in done.stdout,
+          "the script runs as a process and exits 4 on a plan that holds a key back")
     done = subprocess.run([sys.executable, script, "--self-test", "--bogus"],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           universal_newlines=True)

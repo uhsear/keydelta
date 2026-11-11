@@ -61,6 +61,10 @@ PASS  refused: a truncated first page  <-- pinned defect
 ...
 PASS  a repeated CSV header is refused, not read as NO CHANGE  <-- pinned defect
 ...
+PASS  an unquoted comma is refused with exit 3, not read as NO CHANGE  <-- pinned defect
+...
+PASS  held keys beside a change still give a plan but exit 4, and a tripped rail still wins  <-- pinned defect
+...
 PASS  --key @geometry on a CSV is exit 64, not a crash  <-- pinned defect
 ...
 PASS  --ap is refused, not read as a longer flag  <-- pinned defect
@@ -76,10 +80,10 @@ PASS  and raises() accepts the exception it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-248 assertions, 0 failed
+252 assertions, 0 failed
 ```
 
-The full run prints all 248 assertions. Each `...` line above is where this block is cut.
+The full run prints all 252 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -115,10 +119,10 @@ one, a set of buttons, so the name is not taken by another tool for this.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Each snapshot is a CSV, or a saved feature set (`.json`) from a layer query.
 
-The self-test prints the same 248 assertions on Windows (Python 3.13.2 and 3.9.25) and on
+The self-test prints the same 252 assertions on Windows (Python 3.13.2 and 3.9.25) and on
 Ubuntu (Python 3.12.3 and 3.9.25). The four outputs are identical line for line once the Windows
 carriage returns are removed (the same MD5 of the output on all four).
-`coverage run --branch keydelta.py --self-test` reports 100 percent of 953 statements and 198
+`coverage run --branch keydelta.py --self-test` reports 100 percent of 961 statements and 198
 branches.
 
 ```
@@ -156,7 +160,7 @@ python keydelta.py response.json target.csv --key SEG_ID
 | `--sample` | `10` | How many keys to list under each heading. `0` lists none. |
 | `--out` | off | Path for the plan file, a new JSON file. Needs `--apply` to be written. |
 | `--apply` | off | Write `--out`. Without it nothing is written. |
-| `--self-test` | off | Run the assertions and exit. Other flags are ignored. |
+| `--self-test` | off | Run the assertions and exit. Other known flags are ignored, an unknown flag exits 64. |
 
 Every flag must be spelled in full. The parser sets `allow_abbrev=False`, so `--ap` is refused
 with exit 64 instead of being read as `--apply`, and `--tol` is refused instead of being read as
@@ -352,7 +356,7 @@ The rules, each pinned in the self-test:
   the key, or ignored, or `@geometry`), for a repeated column, and for a value that is not a whole
   number from 0 to 38. A scale on a column that is not in the files is never a silent no-op.
 - A JSON float from a feature set and the value stored in a CSV compare the same way.
-- The keys that matched only after rounding are listed in the report, counted, and written to the
+- The single-row keys that matched only after rounding are listed in the report, counted, and written to the
   plan file with the scale map. The report prints the scale line only when `--scale` is used.
 
 What the Esri and Microsoft pages say, and what the tool relies on:
@@ -361,9 +365,9 @@ What the Esri and Microsoft pages say, and what the tool relies on:
   the right of the decimal point", from 0 through the precision, and the maximum precision is 38
   ([decimal and numeric](https://learn.microsoft.com/en-us/sql/t-sql/data-types/decimal-and-numeric-transact-sql)).
   That is where the 0 to 38 range comes from.
-- The same page says "SQL Server uses rounding when converting a number to a decimal or numeric
-  value with a lower precision and scale". It rounds. It does not truncate. A truncating column
-  would need a different rule, and the tool has none.
+- The same page says "By default, SQL Server uses rounding when converting a number to a decimal
+  or numeric value with a lower precision and scale". It rounds by default. The page does not describe other settings, so I make no claim about them. A
+  truncating column would need a different rule, and the tool has none.
 - That page does not say how a tie is broken on a conversion. The `ROUND` function's page does:
   "`ROUND` breaks ties by rounding half away from zero"
   ([ROUND](https://learn.microsoft.com/en-us/sql/t-sql/functions/round-transact-sql)).
@@ -387,6 +391,8 @@ The tool refuses before it plans, and it refuses a plan it has made.
   lines are named.
 - A CSV that repeats a column name. Only the last column of that name would be read, so a change
   in the earlier one would show as `NO CHANGE`. The file is refused and the names are listed.
+- A CSV row whose field count differs from the header. A cell beyond the header would be dropped, so
+  a real edit in it would show as `NO CHANGE`. The row is refused with its line number, exit 3.
 - A source with fewer rows than `--min-rows`. An empty source plans to delete the target.
 - A feature set whose `exceededTransferLimit` is `true`. Esri's query documentation describes
   that property through paging: there are no more pages to fetch when it is `false`. A `true`
@@ -439,11 +445,11 @@ load into an empty target, which has no row to divide by, and for a bulk load yo
 
 | Code | Meaning |
 |---|---|
-| 0 | A plan was made and no rail tripped. A plan with no change is also 0. |
+| 0 | A plan was made, no rail tripped and no key was held back. A plan with no change is also 0. |
 | 1 | A rail refused the plan. |
 | 2 | A file could not be read or written. The verdict still prints when the write failed. |
-| 3 | An input was refused: blank key, repeated column name, too few source rows, truncated or error response. |
-| 4 | Only held-back duplicate keys are left, so the verdict is `HELD BACK`. The published copy is not known to match. |
+| 3 | An input was refused: blank key, repeated column name, a CSV row whose field count differs from the header, too few source rows, truncated or error response. |
+| 4 | A duplicate key was held back. With nothing else to write the verdict is `HELD BACK`. With other changes it is `PLAN READY`, and the plan file is still written under `--apply`. The published copy is not known to match. |
 | 64 | Usage error, including a bad column name, a bad or unmatched `--scale`, a flag prefix, two files with different columns and a file with no columns. |
 | 70 | An unexpected crash in the tool. Never a finding about the data. |
 
@@ -459,7 +465,8 @@ held back, a person decides:
 VERDICT: HELD BACK, 1 duplicate key(s) left as published, a person decides. Nothing else to write.
 ```
 
-A plan with changes and held-back keys, like the demo above, exits 0. Read the held back count.
+A plan with changes and held-back keys, like the demo above, prints `PLAN READY` and exits 4, so a
+scheduled job that reads only the exit code does not take the held rows for in step.
 
 ## Limits
 
@@ -511,13 +518,14 @@ A plan with changes and held-back keys, like the demo above, exits 0. Read the h
 - Only UTF-8 CSV is supported. Other bytes are decoded lossily, so two different keys can
   collapse into one, and so can two different values. A CSV in cp1252, which Excel writes by
   default, that changes `Caf` plus an acute `e` to `Caf` plus a grave `e` reports `NO CHANGE` with
-  exit 0. Save as UTF-8 first. A short row reads its missing cells as blank and a long row has its
-  extra cells ignored. A UTF-8 byte order mark is removed.
+  exit 0. Save as UTF-8 first. A CSV row whose field count differs from the header, such as an unquoted
+  comma, is refused with exit 3. A UTF-8 byte order mark is removed.
 - A CSV that starts with a blank line, uses semicolons or is UTF-16 exits 64, because the header
   is not read as columns. A UTF-16 feature set is refused too. All are refused cleanly.
-- The parser takes two optional positional files. On Python 3.12 and older, `SOURCE --key K
-  TARGET` (an option between the files) exits 64 with `unrecognized arguments`. Python 3.13
-  accepts it. Put both files first.
+- The parser takes two optional positional files. Whether `SOURCE --key K TARGET` (an option
+  between the files) is accepted depends on the Python build. Python 3.9.25 and Linux 3.12.3 exit
+  64 with `unrecognized arguments`, while Windows 3.12.10 and 3.13.2 accept it. Put both files
+  first.
 - A group of N rows under one key is compared in time that grows with N squared. With a
   low-cardinality column as `--key` and the two files in different orders, 4000 rows under one
   key took about 2 seconds here, and tens of thousands would run for minutes before any rail can
@@ -530,9 +538,26 @@ A plan with changes and held-back keys, like the demo above, exits 0. Read the h
   can make two keys print alike, and a key with a newline can print a line such as
   `VERDICT: NO CHANGE` above the real verdict. The plan file keeps each key as a list. Read the
   exit code, not one line of the report.
-- A plan with changes and held-back keys exits 0 and prints `PLAN READY`. It means the plan is
-  ready for the other rows. Exit 4 happens only when the held keys are all that is left. A job
-  that reads only the exit code should also read the held back count.
+- A column value padded with spaces, such as ` 5.25`, or written with a thousands separator, such
+  as `1,000.50`, is not a plain number. `--scale` compares it as text and plans an update, which
+  errs on the safe side.
+- A duplicate-key group that matches only after rounding counts under "identical duplicate keys,
+  no change", not under "same at storage scale". The rounded count and the `rounded` list in the
+  plan file hold single-row keys only.
+- `--scale` rounds both sides. A target that holds more decimals than the scale you declare is
+  rounded too, so an edit below that place stays hidden.
+- Keys and cell text print to stdout and go to the plan file as they appear in the data. The tool
+  reads no credential and sends no request, but a key column that holds sensitive text puts that
+  text in the report and the plan.
+- The Query page supports "false means no more pages" directly. That a `true` means the file holds
+  the first page only is my inference from it, which the page does not state.
+- The 300,000-row timing and the 4000-rows-under-one-key figure are one-off measurements that the
+  self-test does not run. A later run took 4.6 seconds for 300,000 rows a side and about 4
+  seconds for 4000 rows under one key, so treat both as rough.
+- The mutation figures below cannot be reproduced from this repository, because no harness ships.
+- A plan with changes and held-back keys prints `PLAN READY` and exits 4. The plan is ready for
+  the other rows, and the held rows stay stale in the published copy. A job that applies the plan
+  should treat 4 as "apply, then send a person to the held keys".
 - When the plan file cannot be written, the exit code is 2 but the output still ends with
   `VERDICT: PLAN READY`. Trust the exit code.
 - Rail ceilings use `int(rows * fraction)` in floating point, so `--max-change 0.29` on 100 rows
@@ -552,7 +577,7 @@ A plan with changes and held-back keys, like the demo above, exits 0. Read the h
   but a report pasted into a spreadsheet may read such a key as a formula.
 - The plan file is written in place with exclusive creation, not through a temporary file. A
   failed write can leave a partial file, and the exit code is 2.
-- No line is unreachable offline: coverage is 100 percent of lines and branches (953 statements,
+- No line is unreachable offline: coverage is 100 percent of lines and branches (961 statements,
   198 branches). The tool opens no
   socket and imports no network module, so it has no network path to stub and no credential in it
   to leak. The self-test asserts that its own source imports no network module.
@@ -589,7 +614,8 @@ Other single-file tools in this portfolio that pair with this one:
   an identifier rule that would merge two records into one key. Run it first when the two sides
   spell the key differently; this tool normalises nothing.
 - [idreuse](https://github.com/uhsear/idreuse) - the same hazard from the other side. It refuses a
-  shared ID that is not unique and measures how far apart the two rows of each pair are.
+  shared ID that is not unique and refuses every match that the geometry disproves, by measuring
+  how far apart the two rows of each pair are.
 - [safe-republish](https://github.com/uhsear/safe-republish) - refuse to truncate a feature class
   when its staged replacement fails a plausibility check. Use it where the replacement is still a
   full reload.
