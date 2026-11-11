@@ -575,8 +575,29 @@ scheduled job that reads only the exit code does not take the held rows for in s
   integer in a shape can raise `OverflowError`. Both exit 70, a fault in the tool, not a finding.
 - A run without `--scale` prints no precision line. It compares cells as exact text, or within
   `--tolerance`.
-- On Windows a closed stdout pipe can raise `OSError` 22 instead of `BrokenPipeError`. Both end
-  the run with exit 70 and a traceback.
+- A closed stdout pipe can end the run with exit 70 on some hosts; read the exit code, not the
+  report. A `| head -1` in Git Bash on Windows 3.13.2 gave exit 4 with no traceback, because the
+  output was small.
+- An unclosed CSV quote or a NUL byte is reported by the `csv` module. It exits 2 with an error
+  line and no `VERDICT` line, while other malformed CSV rows exit 3.
+- A JSON `NaN` or `Infinity` literal is read as the text `nan` or `inf`, so it compares equal to
+  the same text in a CSV. Esri does not emit these literals.
+- A blank line between CSV data rows is skipped without a refusal.
+- Exit 1 means a rail refused the plan in a normal run, and it means a failed assertion under
+  `--self-test`. A job that runs both should read the mode, not only the code.
+- A geometry that holds an integer above about 1e308 raises `OverflowError` and exits 70 only when
+  `--tolerance` is above 0, because exact text comparison never reaches the numeric path.
+- A key that holds a control character or a terminal escape sequence prints to the console
+  unchanged. The exit code and the plan file are not affected, so read the exit code.
+- A JSON number with more than 17 significant digits is parsed to a binary float before `--scale`
+  rounds it or the comparison runs, so digits past the float's precision are lost. For example,
+  `2.6749999999999999999` is read as 2.675 and rounds to 2.68 at scale 2. Services that emit
+  doubles write at most 17 digits, so this affects only hand-edited or high-precision JSON.
+- The `--apply` write path was verified through the self-test assertions only: no write without
+  `--apply`, no write on a refusal and no overwrite of an existing plan file. A manual run of a
+  live `--apply` command line was not done in the last audit.
+- The Python 3.9.25 self-test count was not re-run on Ubuntu, because that host has only 3.12.3.
+  The 3.9 count was measured on Windows 3.9.25.
 - The change ceiling is `int(rows * 0.10)`, so a target of fewer than 10 rows allows no change and
   refuses a single edit with exit 1. Raise `--max-change` for a table that small.
 - A number with an exponent of 19 digits or more, such as `1e-9999999999999999999`, is beyond the
