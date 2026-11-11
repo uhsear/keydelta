@@ -24,9 +24,17 @@ bits of a coordinate after a write, with no edit at all. The diff flags it, the 
 and tomorrow it is flagged again. The log stops being a signal, because the same rows are in it
 every night.
 
-This tool plans the delta, treats a duplicate key as a fact to report, and counts a difference
-inside a tolerance as no change. A plan that would delete most of the table, or that shares no
-key between the two sides, is refused.
+The third trap is a length column that the published copy stores at two decimal places. The
+source holds the full float, `101.5000000004`, and the copy holds `101.50`. As text they differ,
+so the keyed diff flags every row, every night. Sixty rows read as sixty edits, the change rail
+refuses the plan, and the three real edits in the batch are lost among the false ones. A
+tolerance hides the noise, but it hides it everywhere: a tolerance of 0.01 also hides a real edit
+of 0.006 that would store as a different number.
+
+This tool plans the delta, treats a duplicate key as a fact to report, counts a difference
+inside a tolerance as no change, and compares a column at the decimal places you say it stores
+(`--scale LEN_FT=2`), and prints which scale it used. A plan that would delete most of the table,
+or that shares no key between the two sides, is refused.
 
 ```
 $ python keydelta.py --self-test
@@ -40,6 +48,12 @@ PASS  a key two source rows share is held back, with the rows named  <-- pinned 
 PASS  the held key is not inserted, updated or deleted, so the published row stays  <-- pinned defect
 ...
 PASS  a 1e-9 difference is suppressed and listed, not rewritten every night  <-- pinned defect
+...
+PASS  an edit of 0.006 that stores as 10.01 is a change at scale 2, though a tolerance of 0.01 would hide it  <-- pinned defect
+...
+PASS  without --scale every float reads as an edit and the change rail refuses  <-- pinned defect
+...
+PASS  --scale on a column the files do not hold is exit 64, not a silent no-op  <-- pinned defect
 ...
 PASS  two populated tables with no shared key are refused by name  <-- pinned defect
 ...
@@ -62,10 +76,10 @@ PASS  and raises() accepts the exception it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-199 assertions, 0 failed
+248 assertions, 0 failed
 ```
 
-The full run prints all 199 assertions. Each `...` line above is where this block is cut.
+The full run prints all 248 assertions. Each `...` line above is where this block is cut.
 
 ## What already exists
 
@@ -83,12 +97,16 @@ Diffing two tables on a key is a solved problem, and these do it well.
 - ArcGIS Pro's [Table Compare](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/table-compare.html)
   tool sorts both tables on a field you name and, by default, stops at the first difference. Its
   page says the compare tools do not try to find the next matching records after an added or
-  deleted record.
+  deleted record. It has an Attribute Tolerance parameter that sets, per numeric field, "the
+  range in which attribute values are considered equal". That is an absolute range. The page
+  does not mention precision, scale or decimal places, so rounding to a stored scale is not
+  what it offers.
 
 I did not run csvdiff or daff for this README. Their pages say nothing about a key that two rows
 share, so I make no claim about what they do with one. I also found no page that describes pricing
 the diff against the delete-all, or listing the rows a duplicate key held back. This tool adds
-those three things: the duplicate handling, the tolerance, and the refusals. A search of GitHub
+those four things: the duplicate handling, the tolerance, the comparison at a declared storage
+scale, and the refusals. A search of GitHub
 for the name `keydelta` on the day this was written found this repository and one unrelated
 one, a set of buttons, so the name is not taken by another tool for this.
 
@@ -97,10 +115,11 @@ one, a set of buttons, so the name is not taken by another tool for this.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Each snapshot is a CSV, or a saved feature set (`.json`) from a layer query.
 
-The self-test prints the same 199 assertions on Windows (Python 3.13.2), on Python 3.9.25 and
-on Ubuntu (Python 3.12.3). The three outputs are identical line for line once the Windows
-carriage returns are removed.
-`coverage run --branch keydelta.py --self-test` reports 100 percent of lines and branches.
+The self-test prints the same 248 assertions on Windows (Python 3.13.2 and 3.9.25) and on
+Ubuntu (Python 3.12.3 and 3.9.25). The four outputs are identical line for line once the Windows
+carriage returns are removed (the same MD5 of the output on all four).
+`coverage run --branch keydelta.py --self-test` reports 100 percent of 953 statements and 198
+branches.
 
 ```
 git clone https://github.com/uhsear/keydelta.git
@@ -116,6 +135,7 @@ python keydelta.py --self-test
 python keydelta.py source.csv target.csv --key SEG_ID
 python keydelta.py source.csv target.csv --key CITY --key SEG_NO --ignore EDITED_ON
 python keydelta.py source.csv target.csv --key SEG_ID --tolerance 0.01
+python keydelta.py source.csv target.csv --key SEG_ID --scale LEN_FT=2
 python keydelta.py source.csv target.csv --key SEG_ID --out plan.json --apply
 python keydelta.py response.json target.csv --key SEG_ID
 ```
@@ -127,6 +147,7 @@ python keydelta.py response.json target.csv --key SEG_ID
 | `--key` | none | A key column, on both sides. Required. Repeat it for a composite key. |
 | `--ignore` | none | A column to leave out of the comparison, such as an edit timestamp. Repeatable. |
 | `--tolerance` | `0` | Two numbers within this are equal. At `0` the comparison is exact text. |
+| `--scale` | none | `COLUMN=N`: the column stores N decimal places (0 to 38). Two numbers that round to the same value at N places are no change. It replaces `--tolerance` for that column. Repeatable, one per column. |
 | `--min-rows` | `1` | Refuse a source with fewer rows than this. |
 | `--max-change` | `0.10` | Refuse more inserts, updates and deletes than this fraction of the target. It also caps the rows under held-back keys, as a fraction of the rows read from both files. |
 | `--max-delete` | `0.02` | Refuse more deletes than this fraction of the target. |
@@ -139,7 +160,7 @@ python keydelta.py response.json target.csv --key SEG_ID
 
 Every flag must be spelled in full. The parser sets `allow_abbrev=False`, so `--ap` is refused
 with exit 64 instead of being read as `--apply`, and `--tol` is refused instead of being read as
-`--tolerance`. The self-test pins eleven prefixes, and one run through `main` that confirms
+`--tolerance`. The self-test pins twelve prefixes, and one run through `main` that confirms
 `--ap` writes no file.
 
 **Geometry.** A saved feature set that carries a `geometry` for any feature gets one extra
@@ -236,7 +257,8 @@ the change rail refuses the run. A column that changes on every write belongs in
 
 **The plan file.** `--out plan.json --apply` writes the plan as JSON: the key and compared
 columns, both row counts, both delta costs, the inserts and deletes as key lists, each update
-with its changed columns, and each held-back key with its rows. Nothing else is written. Keys in
+with its changed columns, each held-back key with its rows, the `scale` map that was used and
+the `rounded` keys. Nothing else is written. Keys in
 the file are lists, one entry per key column, so a composite key stays whole.
 
 ```
@@ -255,6 +277,104 @@ record as it previously existed and adding the altered record"
 So the keyed plan costs one row per insert, one per delete and two per update. A delete-all plus
 insert-all costs one deletes row per target row and one adds row per source row. The line prices
 both. It is an estimate from that rule, not a measurement of any table.
+
+## Storage precision
+
+A column that the published copy stores at fixed decimals cannot hold the full float of the
+source. `--scale LEN_FT=2` tells the tool that LEN_FT stores two decimal places. For that column
+two numbers are equal when they round to the same value at two places. The tool rounds the text as
+written, half away from zero, using Python's `decimal` module, never a binary float.
+
+The demo tables are synthetic. `source.csv` and `target.csv` hold 60 segments each. The source
+holds LEN_FT as a full float, such as `101.5000000004`, and the target holds `101.50`. The
+differences, all of them seeded: `S07` has a new name in the source, `S21` is `121.634` against a
+stored `121.50`, `S30` is `130.504` against `130.50`, and `S31` is `131.506` against `131.50`.
+Without `--scale`:
+
+```
+$ python keydelta.py source.csv target.csv --key SEG_ID --ignore EDITED_ON
+keydelta: source.csv 60 row(s), target.csv 60 row(s)
+key: SEG_ID. compared columns: 2
+rows planned:
+  unchanged    0
+  update       60
+...
+delta-table rows, traditional versioning: keyed plan 120, delete-all plus insert-all 120
+
+updates:
+  S01  columns LEN_FT
+...
+REFUSED   60 changed rows exceeds the ceiling of 6 (10% of 60 target rows). That is more likely a bad read than real editing. Rerun with --force-large if it is intended.
+
+VERDICT: REFUSED, 1 rail(s) tripped. Do not apply this plan.
+```
+
+With the scale declared, the plan says which precision it used, and carries only the real edits:
+
+```
+$ python keydelta.py source.csv target.csv --key SEG_ID --ignore EDITED_ON --scale LEN_FT=2
+keydelta: source.csv 60 row(s), target.csv 60 row(s)
+key: SEG_ID. compared columns: 2
+storage scale used, decimal places, half away from zero: LEN_FT=2
+rows planned:
+  unchanged    57
+  update       3
+  insert       0
+  delete       0
+  held back    0 (duplicate key, left as published)
+  identical duplicate keys, no change    0
+  noise inside tolerance, no change      0
+  same at storage scale, no change       57
+delta-table rows, traditional versioning: keyed plan 6, delete-all plus insert-all 120
+
+updates:
+  S07  columns NAME
+  S21  columns LEN_FT
+  S31  columns LEN_FT
+
+same at storage scale, not rewritten:
+  S01
+...
+VERDICT: PLAN READY, 3 update(s), 0 insert(s), 0 delete(s), 0 held back.
+```
+
+`S30` is not an update, because `130.504` stores as `130.50`. `S31` is one, because `131.506`
+stores as `131.51`. A tolerance of 0.01 cannot tell these two apart. Run on the same files with
+`--tolerance 0.01 --max-change 0.5` it plans two updates, `S07` and `S21`, and hides `S31`:
+a real edit that would have changed the stored value.
+
+The rules, each pinned in the self-test:
+
+- A scale replaces `--tolerance` for its column. Other columns keep the tolerance.
+- A cell that is not a plain number on both sides is compared as text. A code with a leading
+  zero, `nan`, `inf` and an empty cell are never rounded.
+- `--scale` is a usage error, exit 64, for a column that is not compared (missing from a file, or
+  the key, or ignored, or `@geometry`), for a repeated column, and for a value that is not a whole
+  number from 0 to 38. A scale on a column that is not in the files is never a silent no-op.
+- A JSON float from a feature set and the value stored in a CSV compare the same way.
+- The keys that matched only after rounding are listed in the report, counted, and written to the
+  plan file with the scale map. The report prints the scale line only when `--scale` is used.
+
+What the Esri and Microsoft pages say, and what the tool relies on:
+
+- SQL Server: a `decimal(p,s)` column's scale is "the number of decimal digits that are stored to
+  the right of the decimal point", from 0 through the precision, and the maximum precision is 38
+  ([decimal and numeric](https://learn.microsoft.com/en-us/sql/t-sql/data-types/decimal-and-numeric-transact-sql)).
+  That is where the 0 to 38 range comes from.
+- The same page says "SQL Server uses rounding when converting a number to a decimal or numeric
+  value with a lower precision and scale". It rounds. It does not truncate. A truncating column
+  would need a different rule, and the tool has none.
+- That page does not say how a tie is broken on a conversion. The `ROUND` function's page does:
+  "`ROUND` breaks ties by rounding half away from zero"
+  ([ROUND](https://learn.microsoft.com/en-us/sql/t-sql/functions/round-transact-sql)).
+  The tool uses that rule for ties, and I did not test it against a SQL Server instance. If your
+  database breaks a tie another way, a value that is exactly halfway can read as an edit or as no
+  change wrongly.
+- Esri: the Add Field tool's Field Scale is "the number of decimal places stored in a field", and
+  "only applicable to fields of type float or double". "If the input table is in a file
+  geodatabase, the field scale value will be ignored"
+  ([Add Field](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/data-management/add-field.html)).
+  So a scale you read off a file geodatabase field is not a storage fact. It is a rule you choose.
 
 ## Refusals
 
@@ -324,7 +444,7 @@ load into an empty target, which has no row to divide by, and for a bulk load yo
 | 2 | A file could not be read or written. The verdict still prints when the write failed. |
 | 3 | An input was refused: blank key, repeated column name, too few source rows, truncated or error response. |
 | 4 | Only held-back duplicate keys are left, so the verdict is `HELD BACK`. The published copy is not known to match. |
-| 64 | Usage error, including a bad column name, a flag prefix, two files with different columns and a file with no columns. |
+| 64 | Usage error, including a bad column name, a bad or unmatched `--scale`, a flag prefix, two files with different columns and a file with no columns. |
 | 70 | An unexpected crash in the tool. Never a finding about the data. |
 
 Exit 4 is the held-only case. Two tables of which the only difference is one key that the source
@@ -358,6 +478,18 @@ A plan with changes and held-back keys, like the demo above, exits 0. Read the h
   columns. `nan` and `inf` are text. The limit is inclusive in exact arithmetic but not in binary
   floating point: `1` against `1.01` at tolerance `0.01` is not equal, because the difference is
   0.010000000000000009. Set the tolerance a little above the noise you mean to hide.
+- A `--scale` is a fact you declare. The tool cannot read it from the data or the database. A
+  scale lower than the column really stores hides real edits below that place, as an edit of 0.004
+  disappears at scale 2. A scale higher than the column stores leaves the rounding noise in. Take
+  it from the field definition, such as the `s` of a SQL Server `decimal(p,s)`.
+- `--scale` rounds the number as the text writes it. A JSON float is written with Python's
+  shortest `repr`, so `1.005` is read as the text `1.005` and rounds to `1.01`, though the binary
+  float nearest to 1.005 is a hair below it. What a database does with that float on conversion is
+  not described by the pages I read. A value that lands exactly on a tie can disagree with the
+  database. That affects only values that end in a 5 at the place after the scale.
+- `--scale` compares a column when both cells are plain numbers. It does not model a `decimal`
+  column's precision limit, so a value too large for `p` digits is not flagged. It does not model
+  truncation either.
 - One `--tolerance` applies to every numeric column and every coordinate, in the units of each.
   In degrees, `0.01` hides a move of about 1 km as noise. The same value applies to numbers inside
   the geometry JSON, such as a `wkid`, and to code columns that look like numbers, so keep it well
@@ -420,17 +552,22 @@ A plan with changes and held-back keys, like the demo above, exits 0. Read the h
   but a report pasted into a spreadsheet may read such a key as a formula.
 - The plan file is written in place with exclusive creation, not through a temporary file. A
   failed write can leave a partial file, and the exit code is 2.
-- No line is unreachable offline: coverage is 100 percent of lines and branches. The tool opens no
+- No line is unreachable offline: coverage is 100 percent of lines and branches (953 statements,
+  198 branches). The tool opens no
   socket and imports no network module, so it has no network path to stub and no credential in it
   to leak. The self-test asserts that its own source imports no network module.
 - A mutation sweep of 519 mutants, run on the revision before the last two fixes, of the code outside the self-test (flipped comparisons, `and`
   and `or` swaps, forced branches, dropped statements, constants plus one) left 4 alive. They are
   the `if __name__ == "__main__"` guard and `return _run(argv)` in `main`, each of which makes the
   script do nothing so the self-test never starts. The self-test kills the other 515.
-- The self-test counts the same on all three interpreters. The cp1252 console assertion builds its
+  The sweep was not re-run after `--scale` was added, so the new code has the 100 percent
+  branch coverage and its own assertions, but no mutation figure.
+- The self-test counts the same on all four interpreters. The cp1252 console assertion builds its
   own stream in memory, so it gives the same answer on a host whose console is UTF-8.
-- I read the Esri pages above for the behaviours this README relies on. I did not test the tool
-  against a live geodatabase, and the cost line was not compared with real delta-table counts.
+- I read the Esri and Microsoft pages above for the behaviours this README relies on. I did not
+  test the tool against a live geodatabase or a SQL Server instance, and the cost line was not
+  compared with real delta-table counts. The scale rounding is checked against the rule on the
+  pages, not against a database that holds a rounded column.
 
 ## Contributing
 

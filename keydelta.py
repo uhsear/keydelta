@@ -21,8 +21,12 @@ price the plan against the delete-all it replaces.
     python keydelta.py source.csv target.csv --key SEG_ID
     python keydelta.py source.csv target.csv --key CITY --key SEG_NO --ignore EDITED_ON
     python keydelta.py source.csv target.csv --key SEG_ID --tolerance 0.01
+    python keydelta.py source.csv target.csv --key SEG_ID --scale LEN_FT=2
     python keydelta.py source.csv target.csv --key SEG_ID --out plan.json --apply
     python keydelta.py response.json target.csv --key SEG_ID --force-large
+
+--scale COLUMN=N compares a column at the N decimal places it stores, so a float that was
+rounded on its way into the table is not an edit on every rerun. The plan names the scales used.
 
 A key that two rows share is never planned: it is held back and left as published, unless both
 sides hold the same rows under it, which is no change. Nothing is written without --apply, and
@@ -38,6 +42,7 @@ import argparse
 import ast
 import contextlib
 import csv
+import decimal
 import importlib.util
 import io
 import json
@@ -66,6 +71,13 @@ GEOM_COL = "@geometry"
 # hex, no nan or inf. float() alone accepts all of those.
 PLAIN_NUMBER = re.compile(r"[+-]?(0|[1-9][0-9]*)(\.[0-9]*)?([eE][+-]?[0-9]+)?\Z|"
                           r"[+-]?\.[0-9]+([eE][+-]?[0-9]+)?\Z")
+
+
+# The most decimal places a SQL Server decimal or numeric column can store (precision 38).
+MAX_SCALE = 38
+# Ties round half away from zero. 400 digits holds any finite float (309 digits) plus 38 places.
+SCALE_CONTEXT = decimal.Context(prec=400, rounding=decimal.ROUND_HALF_UP)
+SCALE_SPEC = re.compile(r"[0-9]{1,2}\Z")
 
 
 class InputRefused(Exception):
@@ -130,20 +142,53 @@ def geometry_equal(a, b, tolerance):
         return False
 
 
-def differing(src_cells, tgt_cells, columns, tolerance):
-    """(changed columns, noisy). noisy: some cell differs as text but sits inside tolerance."""
+def at_scale(text, scale):
+    """The number in text rounded half away from zero to scale decimal places, as a Decimal.
+    None when text is not a finite plain number. The text is rounded as written, never
+    through a binary float, so 2.675 at scale 2 is 2.68."""
+    if to_float(text) is None:
+        return None
+    return decimal.Decimal(text).quantize(decimal.Decimal(1).scaleb(-scale),
+                                          context=SCALE_CONTEXT)
+
+
+def differing_full(src_cells, tgt_cells, columns, tolerance, scales=None):
+    """(changed columns, noisy, rounded).
+
+    noisy: some cell differs as text but sits inside tolerance.
+    rounded: some cell differs as text but is the same number at its column's storage scale.
+    scales maps a column name to the decimal places that column stores. On a column with a
+    scale, two numbers are equal when they round to the same value, and --tolerance does not
+    apply. A cell that is not a number falls back to the tolerance test.
+    """
+    scales = scales or {}
     changed = []
     noisy = False
+    rounded = False
     for col in columns:
         a, b = src_cells[col], tgt_cells[col]
         if a == b:
             continue
+        if col in scales:
+            x, y = at_scale(a, scales[col]), at_scale(b, scales[col])
+            if x is not None and y is not None:
+                # A declared scale is the stored truth, so it replaces --tolerance here.
+                if x == y:
+                    rounded = True
+                else:
+                    changed.append(col)
+                continue
         same = geometry_equal if col == GEOM_COL else values_equal
         if same(a, b, tolerance):
             noisy = True
         else:
             changed.append(col)
-    return changed, noisy
+    return changed, noisy, rounded
+
+
+def differing(src_cells, tgt_cells, columns, tolerance):
+    """(changed columns, noisy). noisy: some cell differs as text but sits inside tolerance."""
+    return differing_full(src_cells, tgt_cells, columns, tolerance)[:2]
 
 
 def group_by_key(records):
@@ -154,14 +199,14 @@ def group_by_key(records):
     return groups
 
 
-def same_rows(src_group, tgt_group, columns, tolerance):
+def same_rows(src_group, tgt_group, columns, tolerance, scales=None):
     """True when both groups hold the same rows, in any order (greedy one-to-one match)."""
     if len(src_group) != len(tgt_group):
         return False
     free = list(tgt_group)
     for src in src_group:
         for tgt in free:
-            if not differing(src[2], tgt[2], columns, tolerance)[0]:
+            if not differing_full(src[2], tgt[2], columns, tolerance, scales)[0]:
                 free.remove(tgt)
                 break
         else:
@@ -169,17 +214,20 @@ def same_rows(src_group, tgt_group, columns, tolerance):
     return True
 
 
-def classify(src_records, tgt_records, columns, tolerance=0.0):
+def classify(src_records, tgt_records, columns, tolerance=0.0, scales=None):
     """Plan the delta that turns the target into the source.
 
     A key held by more than one row on either side is never inserted, updated or deleted.
     It is held back and left as published, because a join on it cannot say which row the
     other side meant. When both sides hold the same rows under it, it is no change.
+    scales names the decimal places a column stores. Two numbers that are equal once rounded
+    to that scale are no change, and the key is listed under "rounded".
     """
     src = group_by_key(src_records)
     tgt = group_by_key(tgt_records)
     plan = {"inserts": [], "updates": [], "deletes": [], "held": [],
-            "suppressed": [], "held_rows": 0, "unchanged": 0, "duplicate_identical": 0,
+            "suppressed": [], "rounded": [], "scales": dict(scales or {}),
+            "held_rows": 0, "unchanged": 0, "duplicate_identical": 0,
             "shared_keys": 0, "source_rows": len(src_records),
             "target_rows": len(tgt_records)}
     for key in sorted(set(src) | set(tgt)):
@@ -187,7 +235,7 @@ def classify(src_records, tgt_records, columns, tolerance=0.0):
         if s_group and t_group:
             plan["shared_keys"] += 1
         if len(s_group) > 1 or len(t_group) > 1:
-            if same_rows(s_group, t_group, columns, tolerance):
+            if same_rows(s_group, t_group, columns, tolerance, scales):
                 plan["duplicate_identical"] += 1
             else:
                 plan["held_rows"] += len(s_group) + len(t_group)
@@ -200,13 +248,16 @@ def classify(src_records, tgt_records, columns, tolerance=0.0):
         elif not s_group:
             plan["deletes"].append(list(key))
         else:
-            changed, noisy = differing(s_group[0][2], t_group[0][2], columns, tolerance)
+            changed, noisy, rounded = differing_full(
+                s_group[0][2], t_group[0][2], columns, tolerance, scales)
             if changed:
                 plan["updates"].append({"key": list(key), "columns": changed})
             else:
                 plan["unchanged"] += 1
                 if noisy:
                     plan["suppressed"].append(list(key))
+                if rounded:
+                    plan["rounded"].append(list(key))
     return plan
 
 
@@ -278,8 +329,12 @@ def key_label(key):
 def describe(plan, columns, keys, sample):
     """The report as a list of lines."""
     keyed, wholesale = delta_cost(plan)
-    lines = [
-        "key: %s. compared columns: %d" % (", ".join(keys), len(columns)),
+    lines = ["key: %s. compared columns: %d" % (", ".join(keys), len(columns))]
+    scales = plan["scales"]
+    if scales:
+        lines.append("storage scale used, decimal places, half away from zero: %s" % ", ".join(
+            "%s=%d" % (col, scales[col]) for col in sorted(scales)))
+    lines += [
         "rows planned:",
         "  unchanged    %d" % plan["unchanged"],
         "  update       %d" % len(plan["updates"]),
@@ -288,9 +343,12 @@ def describe(plan, columns, keys, sample):
         "  held back    %d (duplicate key, left as published)" % len(plan["held"]),
         "  identical duplicate keys, no change    %d" % plan["duplicate_identical"],
         "  noise inside tolerance, no change      %d" % len(plan["suppressed"]),
-        "delta-table rows, traditional versioning: keyed plan %d, delete-all plus insert-all %d"
-        % (keyed, wholesale),
     ]
+    if scales:
+        lines.append("  same at storage scale, no change       %d" % len(plan["rounded"]))
+    lines.append(
+        "delta-table rows, traditional versioning: keyed plan %d, delete-all plus insert-all %d"
+        % (keyed, wholesale))
 
     def section(title, items, text):
         if items:
@@ -308,6 +366,7 @@ def describe(plan, columns, keys, sample):
     section("inserts:", plan["inserts"], key_label)
     section("deletes:", plan["deletes"], key_label)
     section("noise inside tolerance, not rewritten:", plan["suppressed"], key_label)
+    section("same at storage scale, not rewritten:", plan["rounded"], key_label)
     return lines
 
 
@@ -345,6 +404,8 @@ def plan_document(plan, keys, columns, problems):
         "deletes": plan["deletes"],
         "held": plan["held"],
         "suppressed": plan["suppressed"],
+        "scale": plan["scales"],
+        "rounded": plan["rounded"],
     }
 
 
@@ -470,7 +531,28 @@ def to_records(raw, keys, side):
     return records
 
 
-def build_plan(src_path, tgt_path, keys, ignore, tolerance, min_rows):
+def parse_scales(specs, keys, ignore):
+    """['COLUMN=N', ...] -> {column: N}. Raises ValueError for a spec the tool cannot trust."""
+    scales = {}
+    for spec in specs:
+        name, sep, digits = spec.rpartition("=")
+        if not sep or not name or not SCALE_SPEC.match(digits) or int(digits) > MAX_SCALE:
+            raise ValueError(
+                "--scale %s must be COLUMN=N, with N a whole number of decimal places from 0 "
+                "to %d." % (spec, MAX_SCALE))
+        if name in scales:
+            raise ValueError("--scale names %s twice." % name)
+        if name in keys or name in ignore:
+            raise ValueError(
+                "--scale %s is a --key or --ignore column. A scale applies only to a compared "
+                "column." % name)
+        if name == GEOM_COL:
+            raise ValueError("--scale cannot name %s. Use --tolerance for a shape." % GEOM_COL)
+        scales[name] = int(digits)
+    return scales
+
+
+def build_plan(src_path, tgt_path, keys, ignore, tolerance, min_rows, scales=None):
     """Read both snapshots and classify. Raises ValueError, InputRefused, OSError, csv.Error."""
     src_header, src_raw = load(src_path)
     tgt_header, tgt_raw = load(tgt_path)
@@ -478,9 +560,13 @@ def build_plan(src_path, tgt_path, keys, ignore, tolerance, min_rows):
     check_columns(src_header, keys, ignore, "source")
     check_columns(tgt_header, keys, ignore, "target")
     columns = compare_columns(src_header, tgt_header, keys, ignore)
+    absent = [c for c in (scales or {}) if c not in columns]
+    if absent:
+        raise ValueError("--scale names a column that is not compared: %s. The compared "
+                         "columns are: %s" % (", ".join(absent), ", ".join(columns)))
     src = to_records(src_raw, keys, "source")
     tgt = to_records(tgt_raw, keys, "target")
-    return classify(src, tgt, columns, tolerance), columns
+    return classify(src, tgt, columns, tolerance, scales), columns
 
 
 # =============================================================================
@@ -506,6 +592,9 @@ def _parse(argv):
                     help="a column to leave out of the comparison. Repeatable.")
     ap.add_argument("--tolerance", type=float, default=0.0,
                     help="two numbers within this are equal (default 0, exact text)")
+    ap.add_argument("--scale", action="append",
+                    help="COLUMN=N: the column stores N decimal places, so two numbers that "
+                         "are equal rounded to N places are no change. Repeatable.")
     ap.add_argument("--min-rows", dest="min_rows", type=int, default=DEFAULT_MIN_ROWS,
                     help="refuse a source with fewer rows (default %d)" % DEFAULT_MIN_ROWS)
     ap.add_argument("--max-change", dest="max_change", type=float, default=DEFAULT_MAX_CHANGE,
@@ -535,6 +624,10 @@ def option_error(args):
     """The first usage error in the options, or None."""
     keys = args.key or []
     ignore = args.ignore or []
+    try:
+        parse_scales(args.scale or [], keys, ignore)
+    except ValueError as exc:
+        return str(exc)
     checks = [
         (not args.source or not args.target,
          "a SOURCE and a TARGET are required. Use --self-test to verify the tool without them."),
@@ -609,7 +702,8 @@ def _run(argv):
     ignore = args.ignore or []
     try:
         plan, columns = build_plan(args.source, args.target, keys, ignore,
-                                   args.tolerance, args.min_rows)
+                                   args.tolerance, args.min_rows,
+                                   parse_scales(args.scale or [], keys, ignore))
     except ValueError as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 64
@@ -1057,7 +1151,7 @@ def _self_test(tmp):
     check(option_error(_parse(["--key", "K", "--apply"])) is not None,
           "no files is a usage error")
     for flag in ("--ap", "--appl", "--ou", "--tol", "--ign", "--k", "--force", "--self", "--sam",
-                 "--max-d", "--min"):
+                 "--max-d", "--min", "--scal"):
         codes = []
         try:
             with contextlib.redirect_stderr(io.StringIO()):
@@ -1304,6 +1398,162 @@ def _self_test(tmp):
           and "VERDICT: REFUSED" in so,
           "a key column that is not a key is refused, not a PLAN READY on one insert  "
           "<-- pinned defect")
+
+    # ---- storage scale: compare at the declared decimals, and say which were used
+    D = decimal.Decimal
+    check(at_scale("2.675", 2) == D("2.68") and at_scale("-2.675", 2) == D("-2.68"),
+          "a tie rounds half away from zero on the text as written, not through a binary float")
+    check(at_scale("2.5", 0) == D("3") and at_scale("-2.5", 0) == D("-3")
+          and at_scale("3.5", 0) == D("4") and at_scale("5", 2) == D("5.00"),
+          "scale 0 rounds ties away from zero both ways and an integer gains no error")
+    check(at_scale("x", 2) is None and at_scale("nan", 2) is None and at_scale("02101", 2) is None
+          and at_scale("", 2) is None and at_scale("1e999", 2) is None,
+          "text, nan, a leading-zero code and an overflow have no scaled value")
+    check(at_scale("1e308", 38) == D("1e308") and at_scale("1e-400", 2) == D("0.00")
+          and at_scale("-0.001", 2) == at_scale("0.001", 2),
+          "the largest and smallest floats do not overflow the decimal context, and "
+          "negative zero equals zero  <-- pinned defect")
+    check(at_scale("10.0000000004", 2) == at_scale("10", 2) and at_scale("1e-05", 2) == D("0.00"),
+          "a float repr with an exponent is read as a number")
+    changed, noisy, rounded = differing_full({"V": "10.0000000004"}, {"V": "10.00"}, ["V"], 0,
+                                             {"V": 2})
+    check(changed == [] and not noisy and rounded,
+          "a float and the value stored at 2 places are the same at scale 2, with no tolerance")
+    changed, noisy, rounded = differing_full({"V": "10.0000000004"}, {"V": "10.00"}, ["V"], 0)
+    check(changed == ["V"] and not rounded,
+          "with no scale declared the same pair is a change, as before  <-- pinned defect")
+    changed, noisy, rounded = differing_full({"V": "10.006"}, {"V": "10.00"}, ["V"], 0.01,
+                                             {"V": 2})
+    check(changed == ["V"] and values_equal("10.006", "10.00", 0.01),
+          "an edit of 0.006 that stores as 10.01 is a change at scale 2, though a tolerance of "
+          "0.01 would hide it  <-- pinned defect")
+    check(differing_full({"V": "1.005"}, {"V": "1.01"}, ["V"], 0.005, {"V": 2})[2]
+          and not values_equal("1.005", "1.01", 0.005),
+          "a tie at scale 2 is the same as the stored 1.01, which float tolerance 0.005 "
+          "misses  <-- pinned defect")
+    check(differing_full({"V": "12.344"}, {"V": "12.346"}, ["V"], 0, {"V": 2})[0] == ["V"],
+          "two values that round to different stored numbers are a change")
+    check(differing_full({"V": "abc"}, {"V": "abd"}, ["V"], 0, {"V": 2})[0] == ["V"]
+          and differing_full({"V": "abc"}, {"V": "1"}, ["V"], 0, {"V": 2})[0] == ["V"]
+          and differing_full({"V": "1"}, {"V": "abc"}, ["V"], 0, {"V": 2})[0] == ["V"],
+          "a scale on a column that holds text on either side changes nothing")
+    check(differing_full({"V": "02101"}, {"V": "2101"}, ["V"], 0, {"V": 2})[0] == ["V"],
+          "a leading-zero code is not rounded to a number  <-- pinned defect")
+    changed, noisy, rounded = differing_full(
+        {"A": "1.0000004", "B": "5.001"}, {"A": "1.00", "B": "5.0"}, ["A", "B"], 0.01, {"A": 2})
+    check(changed == [] and noisy and rounded,
+          "a column under a scale and a column under the tolerance can each be no change")
+    changed, noisy, rounded = differing_full({"A": "1.0000004", "B": "5.0"},
+                                             {"A": "1.00", "B": "5.0"}, ["A", "B"], 0)
+    check(changed == ["A"], "a column with no scale keeps comparing exact text")
+    plan = classify(rows(("a", "10.0000000004"), ("b", "7.5"), ("c", "3.104")),
+                    rows(("a", "10.00"), ("b", "7.5"), ("c", "3.10")), ["V"], 0, {"V": 2})
+    check(plan["unchanged"] == 3 and plan["rounded"] == [["a"], ["c"]]
+          and plan["scales"] == {"V": 2} and not plan["updates"],
+          "a plan lists the keys that matched only after rounding and records the scale used")
+    plan = classify(rows(("a", "10.0000000004")), rows(("a", "10.00")), ["V"], 0)
+    check(plan["rounded"] == [] and plan["scales"] == {} and len(plan["updates"]) == 1,
+          "with no scale the plan records none and the rows are updates")
+    plan = classify(rows(("d", "1.0000004"), ("d", "2.0000004")),
+                    rows(("d", "2.00"), ("d", "1.00")), ["V"], 0, {"V": 2})
+    check(plan["duplicate_identical"] == 1 and not plan["held"],
+          "the duplicate match uses the scale too")
+    plan = classify(rows(("a", "10.0000000004"), ("b", "1.234")),
+                    rows(("a", "10.00"), ("b", "1.20")), ["V"], 0, {"V": 2})
+    text = "\n".join(describe(plan, ["V"], ["K"], 10))
+    check("storage scale used, decimal places, half away from zero: V=2" in text
+          and "same at storage scale, no change       1" in text
+          and "same at storage scale, not rewritten:\n  a" in text
+          and text.index("storage scale used") < text.index("rows planned:"),
+          "the report says which precision was used and lists the keys it rounded")
+    text = "\n".join(describe(classify(rows(("a", "1")), rows(("a", "1")), ["V"]), ["V"],
+                             ["K"], 10))
+    check("storage scale" not in text, "a run with no --scale prints no scale line")
+    doc = plan_document(plan, ["K"], ["V"], [])
+    check(doc["scale"] == {"V": 2} and doc["rounded"] == [["a"]]
+          and json.loads(json.dumps(doc)) == doc,
+          "the plan file records the scale and the rounded keys")
+    check(parse_scales(["A=2", "B=0", "C=38", "D=E=3"], ["K"], []) == {
+        "A": 2, "B": 0, "C": 38, "D=E": 3} and parse_scales([], ["K"], []) == {},
+          "--scale reads COLUMN=N, from 0 to 38, and splits on the last =")
+    for spec in ("A", "=2", "A=", "A=x", "A=-1", "A=39", "A=100", "A=1_0", "A= 2", "A=2.0",
+                 "A=\u0662"):
+        raises(lambda spec=spec: parse_scales([spec], [], []),
+               "--scale %s is refused  <-- pinned defect" % ascii(spec))
+    raises(lambda: parse_scales(["A=2", "A=3"], [], []), "--scale naming a column twice is refused")
+    raises(lambda: parse_scales(["K=2"], ["K"], []), "--scale on a --key column is refused")
+    raises(lambda: parse_scales(["Z=2"], ["K"], ["Z"]), "--scale on an --ignore column is refused")
+    raises(lambda: parse_scales(["@geometry=2"], [], []), "--scale on @geometry is refused")
+    check(option_error(_parse(["a.csv", "b.csv", "--key", "K", "--scale", "V=2"])) is None
+          and "COLUMN=N" in option_error(_parse(["a.csv", "b.csv", "--key", "K", "--scale", "V"])),
+          "--scale is checked with the other options")
+
+    # ---- storage scale through main, on real files
+    def scale_row(i, name=None, length=None):
+        return "S%02d,%s,%s,2026-01-0%d\n" % (i, name or "Road %02d" % i,
+                                             length or "%d.50" % (100 + i), 1 + i % 2)
+
+    scale_head = "SEG_ID,NAME,LEN_FT,EDITED_ON\n"
+    scale_src = make("scale_source.csv", scale_head + "".join(
+        scale_row(i, length={21: "121.634", 30: "130.504", 31: "131.506"}.get(
+            i, "%d.5000000004" % (100 + i))) for i in range(1, 61)))
+    scale_tgt = make("scale_target.csv", scale_head + "".join(
+        scale_row(i, "Road 7x" if i == 7 else None) for i in range(1, 61)))
+    scale_base = [scale_src, scale_tgt, "--key", "SEG_ID", "--ignore", "EDITED_ON"]
+    code, so, se = run_cli(scale_base)
+    check(code == 1 and "60 changed rows exceeds the ceiling of 6" in so
+          and "storage scale" not in so,
+          "without --scale every float reads as an edit and the change rail refuses  "
+          "<-- pinned defect")
+    code, so, se = run_cli(scale_base + ["--scale", "LEN_FT=2"])
+    check(code == 0 and "key: SEG_ID. compared columns: 2\nstorage scale used, decimal places, "
+          "half away from zero: LEN_FT=2\nrows planned:\n  unchanged    57\n  update       3\n"
+          in so and "same at storage scale, no change       57\n" in so
+          and "keyed plan 6, delete-all plus insert-all 120" in so,
+          "--scale LEN_FT=2 plans the 3 real edits and 57 rounded rows, and prints the scale")
+    check("updates:\n  S07  columns NAME\n  S21  columns LEN_FT\n  S31  columns LEN_FT\n" in so
+          and "S30" not in so.split("updates:")[1].split("\n\n")[0]
+          and so.endswith("VERDICT: PLAN READY, 3 update(s), 0 insert(s), 0 delete(s), "
+                          "0 held back.\n"),
+          "the edit that stores as 131.51 is listed and the one that stores as 130.50 is not")
+    code, so, se = run_cli(scale_base + ["--tolerance", "0.01", "--max-change", "0.5"])
+    check(code == 0 and "S31" not in so.split("updates:")[1].split("\n\n")[0],
+          "a tolerance of 0.01 hides the edit of S31, so the scale is the stricter test  "
+          "<-- pinned defect")
+    scale_out = os.path.join(tmp, "scale_plan.json")
+    code, so, se = run_cli(scale_base + ["--scale", "LEN_FT=2", "--out", scale_out, "--apply"])
+    with open(scale_out, encoding="utf-8") as handle:
+        scale_doc = json.load(handle)
+    check(code == 0 and scale_doc["scale"] == {"LEN_FT": 2} and len(scale_doc["rounded"]) == 57
+          and len(scale_doc["updates"]) == 3,
+          "--apply writes the scale and the rounded keys into the plan file")
+    code, so, se = run_cli(scale_base + ["--scale", "LEN_FT=2", "--out",
+                                         os.path.join(tmp, "dry_scale.json")])
+    check(code == 0 and "Check only." in so
+          and not os.path.exists(os.path.join(tmp, "dry_scale.json")),
+          "a dry run with --scale writes nothing")
+    code, so, se = run_cli(scale_base + ["--scale", "NOPE=2"])
+    check(code == 64 and "not compared: NOPE" in se and so == "",
+          "--scale on a column the files do not hold is exit 64, not a silent no-op  "
+          "<-- pinned defect")
+    code, so, se = run_cli(scale_base + ["--scale", "SEG_ID=2"])
+    check(code == 64 and "--key or --ignore" in se, "--scale on the key is exit 64")
+    code, so, se = run_cli(scale_base + ["--scale", "LEN_FT=two"])
+    check(code == 64 and "COLUMN=N" in se and so == "", "a bad --scale value is exit 64")
+    feat_rows = [{"attributes": {"SEG_ID": "S%02d" % i, "NAME": "Road %02d" % i,
+                                 "LEN_FT": float(100 + i) + 0.50000000000001, "EDITED_ON": 1}}
+                 for i in range(1, 41)]
+    feat_src = make("scale_feat.json", json.dumps({"features": feat_rows}))
+    scale_tgt40 = make("scale_t40.csv", scale_head + "".join(
+        scale_row(i) for i in range(1, 41)))
+    code, so, se = run_cli([feat_src, scale_tgt40, "--key", "SEG_ID", "--ignore", "EDITED_ON",
+                            "--scale", "LEN_FT=2"])
+    check(code == 0 and "VERDICT: NO CHANGE" in so
+          and "same at storage scale, no change       40" in so,
+          "a feature set that holds JSON floats matches a CSV stored at 2 places")
+    code, so, se = run_cli([feat_src, scale_tgt40, "--key", "SEG_ID", "--ignore", "EDITED_ON"])
+    check(code == 1 and "40 changed rows exceeds the ceiling of 4" in so,
+          "and without --scale the same files are 40 false updates")
 
     # ---- the README demo, rebuilt, so the quoted output is exercised
     def seg(i, name=None, length=None, edited="2026-01-01"):
