@@ -284,9 +284,10 @@ def always_changed_hint(updates):
         every &= set(update["columns"])
     if not every:
         return ""
-    return (" Column(s) %s differ on every updated row. A date stored as epoch milliseconds on "
-            "one side and as text on the other reads this way. Export both sides the same way "
-            "or add --ignore." % ", ".join(sorted(every)))
+    return (" Column(s) %s differ on every updated row. The same value written two ways reads "
+            "this way, such as text against a number, or a full-precision number against its "
+            "stored rounding. Export both sides the same way, add --scale COLUMN=PLACES for a "
+            "number, or add --ignore." % ", ".join(sorted(every)))
 
 
 def guard(plan, force_large, max_change, max_delete, max_duplicates):
@@ -441,6 +442,10 @@ def read_csv(path):
         # strict: an unclosed quote is an error, not one cell that swallows the rest of the file.
         reader = csv.reader(handle, strict=True)
         header = next(reader, [])
+        if not header and reader.line_num:
+            raise InputRefused(
+                "%s starts with a blank line, so it has no header row. Delete the blank line "
+                "first." % path)
         # A repeated header name would keep only the last such column and compare the rest
         # never, so a changed value could read as NO CHANGE. Refuse it.
         repeated = sorted(set(n for n in header if header.count(n) > 1))
@@ -1368,6 +1373,32 @@ def _self_test(tmp):
           and "Column(s) A, B differ" in always_changed_hint(
               [{"columns": ["B", "A", "C"]}, {"columns": ["A", "B"]}]),
           "the hint needs two updates and names only the columns every update shares")
+    check("--scale COLUMN=PLACES" in always_changed_hint([{"columns": ["A"]}] * 2)
+          and "epoch" not in always_changed_hint([{"columns": ["A"]}] * 2),
+          "the hint is not worded for dates and points a number column at --scale")
+    okcsv = make("ok2.csv", "ID,V\n1,2\n")
+    code, so, se = run_cli([make("blank1.csv", "\nID,V\n1,2\n"), okcsv, "--key", "ID"])
+    check(code == 3 and "blank1.csv starts with a blank line" in so
+          and "unquoted comma" not in so,
+          "a CSV that starts with a blank line is refused with exit 3 and the message says so  "
+          "<-- pinned defect")
+    u16 = os.path.join(tmp, "u16.csv")
+    with open(u16, "wb") as handle:
+        handle.write("ID,V\r\n1,2\r\n".encode("utf-16"))
+    code, so, se = run_cli([u16, okcsv, "--key", "ID"])
+    check(code == 3 and "not valid UTF-8" in so, "a UTF-16 CSV is refused with exit 3  "
+          "<-- pinned defect")
+    code, so, se = run_cli([make("semi.csv", "ID;V\n1;2\n"), okcsv, "--key", "ID"])
+    check(code == 64, "a semicolon CSV exits 64, because the key is not a column")
+    hdr_tgt = make("hdr_t.csv", "ID,V\n")
+    first_src = make("first_s.csv", "ID,V\n" + "".join("S%d,x\n" % k for k in range(40)))
+    code, so, se = run_cli([first_src, hdr_tgt, "--key", "ID"])
+    check(code == 1 and "REFUSED" in so,
+          "a header-only target is refused by the change rail without --force-large  "
+          "<-- pinned defect")
+    code, so, se = run_cli([first_src, hdr_tgt, "--key", "ID", "--force-large"])
+    check(code == 0 and "40 insert(s)" in so,
+          "a header-only target plans a first load with --force-large")
     pad = "".join("p%d,x" % k + "\n" for k in range(40))
     code, so, se = run_cli([make("ucs.csv", "ID,NAME\n1,Main St, Apt 2\n" + pad),
                             make("uct.csv", "ID,NAME\n1,Main St, Apt 3\n" + pad), "--key", "ID"])

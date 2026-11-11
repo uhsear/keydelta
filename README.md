@@ -65,6 +65,10 @@ PASS  a CSV that is not UTF-8 is refused with exit 3, not read as NO CHANGE  <--
 PASS  a feature set that is not UTF-8 is refused as bad encoding, not as bad JSON  <-- pinned defect
 PASS  a date as epoch milliseconds against text is a refusal that names the column  <-- pinned defect
 ...
+PASS  a CSV that starts with a blank line is refused with exit 3 and the message says so  <-- pinned defect
+PASS  a UTF-16 CSV is refused with exit 3  <-- pinned defect
+PASS  a header-only target is refused by the change rail without --force-large  <-- pinned defect
+...
 PASS  an unquoted comma is refused with exit 3, not read as NO CHANGE  <-- pinned defect
 PASS  a repeated CSV header is refused, not read as NO CHANGE  <-- pinned defect
 ...
@@ -83,10 +87,10 @@ PASS  and raises() accepts the exception it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-257 assertions, 0 failed
+263 assertions, 0 failed
 ```
 
-The full run prints all 257 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
+The full run prints all 263 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
 
 ## What already exists
 
@@ -122,10 +126,10 @@ one, a set of buttons, so the name is not taken by another tool for this.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Each snapshot is a CSV, or a saved feature set (`.json`) from a layer query.
 
-The self-test prints the same 257 assertions on Windows (Python 3.13.2 and 3.9.25) and on
+The self-test prints the same 263 assertions on Windows (Python 3.13.2 and 3.9.25) and on
 Ubuntu (Python 3.12.3 and 3.9.25). The four outputs are identical line for line once the Windows
 carriage returns are removed (the same MD5 of the output on all four).
-`coverage run --branch keydelta.py --self-test` reports 100 percent of 995 statements and 204
+`coverage run --branch keydelta.py --self-test` reports 100 percent of 1014 statements and 206
 branches.
 
 ```
@@ -311,7 +315,7 @@ delta-table rows, traditional versioning: keyed plan 120, delete-all plus insert
 updates:
   S01  columns LEN_FT
 ...
-REFUSED   60 changed rows exceeds the ceiling of 6 (10% of 60 target rows). That is more likely a bad read than real editing. Rerun with --force-large if it is intended.
+REFUSED   60 changed rows exceeds the ceiling of 6 (10% of 60 target rows). That is more likely a bad read than real editing. Column(s) LEN_FT differ on every updated row. The same value written two ways reads this way, such as text against a number, or a full-precision number against its stored rounding. Export both sides the same way, add --scale COLUMN=PLACES for a number, or add --ignore. Rerun with --force-large if it is intended.
 
 VERDICT: REFUSED, 1 rail(s) tripped. Do not apply this plan.
 ```
@@ -538,12 +542,13 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - `--scale` on a column whose cells are text on both sides is accepted and does nothing, with no
   warning. A non-number cell is compared as text.
 - An empty feature set as the target (`features: []`) exits 64 with a columns-not-in-the-file
-  error, because there is no header to check the key against. A header-only CSV target plans a
-  first load.
+  error, because there is no header to check the key against. A header-only CSV target is a
+  target of 0 rows, so the change rail refuses a first load, and `--force-large` plans it.
 - A JSON number of more than 4300 digits is reported as not valid JSON and exits 3, because
   Python limits the digits of an integer it converts from text.
-- A CSV that starts with a blank line, uses semicolons or is UTF-16 exits 64, because the header
-  is not read as columns. A UTF-16 feature set is refused too. All are refused cleanly.
+- A CSV that starts with a blank line is refused with exit 3 and the message names the blank
+  line. A UTF-16 CSV or feature set is refused with exit 3 as not UTF-8. A semicolon CSV exits 64,
+  because the key is not a column of the one-column header it reads. All are refused cleanly.
 - The parser takes two optional positional files. Whether `SOURCE --key K TARGET` (an option
   between the files) is accepted depends on the Python build. Python 3.9.25 and Linux 3.12.3 exit
   64 with `unrecognized arguments`, while Windows 3.12.10 and 3.13.2 accept it. Put both files
@@ -554,6 +559,18 @@ scheduled job that reads only the exit code does not take the held rows for in s
   fire. Use a real key.
 - A JSON file nested hundreds of thousands of levels deep raises `RecursionError`, and a huge
   integer in a shape can raise `OverflowError`. Both exit 70, a fault in the tool, not a finding.
+- A run without `--scale` prints no precision line. It compares cells as exact text, or within
+  `--tolerance`.
+- On Windows a closed stdout pipe can raise `OSError` 22 instead of `BrokenPipeError`. Both end
+  the run with exit 70 and a traceback.
+- The change ceiling is `int(rows * 0.10)`, so a target of fewer than 10 rows allows no change and
+  refuses a single edit with exit 1. Raise `--max-change` for a table that small.
+- A number with an exponent of about 18 digits or more, such as `1e-99999999999999999999`, read
+  under `--scale` exits 70 with a traceback instead of being compared.
+- A dry run does not test whether `--out` can be created. A path in a missing directory shows its
+  error only under `--apply`, with exit 2.
+- Line endings inside a quoted field are compared as written, so CRLF against LF is an update.
+- A refusal with exit 3 prints on stdout. Usage and file errors, exit 2 and 64, print on stderr.
 - If stdout is a closed pipe, such as a report piped to `head`, a `BrokenPipeError` can end the
   run with exit 70. The exit code then reflects the pipe, not the data.
 - The report prints keys as they are and joins a composite key with `|`. A key that holds `|`
@@ -605,8 +622,8 @@ scheduled job that reads only the exit code does not take the held rows for in s
   but a report pasted into a spreadsheet may read such a key as a formula.
 - The plan file is written in place with exclusive creation, not through a temporary file. A
   failed write can leave a partial file, and the exit code is 2.
-- No line is unreachable offline: coverage is 100 percent of lines and branches (995 statements,
-  204 branches). The tool opens no
+- No line is unreachable offline: coverage is 100 percent of lines and branches (1014 statements,
+  206 branches). The tool opens no
   socket and imports no network module, so it has no network path to stub and no credential in it
   to leak. The self-test asserts that its own source imports no network module.
 - A mutation sweep of 519 mutants, run on the revision before the last two fixes, of the code outside the self-test (flipped comparisons, `and`
