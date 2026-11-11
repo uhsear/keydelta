@@ -54,6 +54,7 @@ PASS  two populated tables with no shared key are refused by name  <-- pinned de
 PASS  held keys beside a change still give a plan but exit 4, and a tripped rail still wins  <-- pinned defect
 ...
 PASS  refused: a truncated first page  <-- pinned defect
+PASS  refused: 1e400 read as inf  <-- pinned defect
 ...
 PASS  --ap is refused, not read as a longer flag  <-- pinned defect
 ...
@@ -87,10 +88,10 @@ PASS  and raises() accepts the exception it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-263 assertions, 0 failed
+267 assertions, 0 failed
 ```
 
-The full run prints all 263 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
+The full run prints all 267 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
 
 ## What already exists
 
@@ -126,10 +127,10 @@ one, a set of buttons, so the name is not taken by another tool for this.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Each snapshot is a CSV, or a saved feature set (`.json`) from a layer query.
 
-The self-test prints the same 263 assertions on Windows (Python 3.13.2 and 3.9.25) and on
+The self-test prints the same 267 assertions on Windows (Python 3.13.2 and 3.9.25) and on
 Ubuntu (Python 3.12.3 and 3.9.25). The four outputs are identical line for line once the Windows
 carriage returns are removed (the same MD5 of the output on all four).
-`coverage run --branch keydelta.py --self-test` reports 100 percent of 1014 statements and 206
+`coverage run --branch keydelta.py --self-test` reports 100 percent of 1027 statements and 208
 branches.
 
 ```
@@ -404,10 +405,14 @@ The tool refuses before it plans, and it refuses a plan it has made.
 - A CSV row whose field count differs from the header. A cell beyond the header would be dropped, so
   a real edit in it would show as `NO CHANGE`. The row is refused with its line number, exit 3.
 - A source with fewer rows than `--min-rows`. An empty source plans to delete the target.
-- A feature set whose `exceededTransferLimit` is `true`. Esri's query documentation describes
-  that property through paging: there are no more pages to fetch when it is `false`. A `true`
-  means the file holds the first page only, and a plan from it would delete every row it did not
-  return ([Query](https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/)).
+- A feature set whose `exceededTransferLimit` is `true`. Esri's query documentation states only
+  the `false` case: there are no more pages to fetch
+  ([Query](https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/)).
+  Reading a `true` as "the file holds a partial page" is my inference from that. A plan from a
+  partial file would delete every row it did not return, so the tool refuses it.
+- A JSON number too large for a binary float, such as `1e400` or a float of 5000 digits. Python
+  reads it as `inf`, and two different huge values would then print as the same text and show as
+  `NO CHANGE`. The file is refused, exit 3.
 - A JSON file that is not valid JSON, is not an object with a `features` list, has an `error`
   object, or has a feature with no `attributes`. The documentation shows failed requests as an
   `error` object with a code and a message. I did not establish the HTTP status that carries it,
@@ -458,9 +463,9 @@ load into an empty target, which has no row to divide by, and for a bulk load yo
 | 0 | A plan was made, no rail tripped and no key was held back. A plan with no change is also 0. |
 | 1 | A rail refused the plan. |
 | 2 | A file could not be read or written. The verdict still prints when the write failed. |
-| 3 | An input was refused: blank key, repeated column name, a CSV row whose field count differs from the header, too few source rows, truncated or error response. |
+| 3 | An input was refused: blank key, repeated column name, a CSV row whose field count differs from the header, too few source rows (a source with no rows too), a JSON number too large for a binary float, truncated or error response. |
 | 4 | A duplicate key was held back. With nothing else to write the verdict is `HELD BACK`. With other changes it is `PLAN READY`, and the plan file is still written under `--apply`. The published copy is not known to match. |
-| 64 | Usage error, including a bad column name, a bad or unmatched `--scale`, a flag prefix, two files with different columns and a file with no columns. |
+| 64 | Usage error, including a bad column name, a bad or unmatched `--scale`, a flag prefix, two files with different columns and a target file with no columns. |
 | 70 | An unexpected crash in the tool. Never a finding about the data. |
 
 Exit 4 is the held-only case. Two tables of which the only difference is one key that the source
@@ -480,6 +485,9 @@ scheduled job that reads only the exit code does not take the held rows for in s
 
 ## Limits
 
+- With `--apply` and a plan that has no change, the tool prints `wrote <file>` and then
+  `VERDICT: NO CHANGE, nothing to write.`. The no-change plan file is still written. `nothing to
+  write` means nothing for a job to apply.
 - It plans and never applies. The plan file is for a person or a separate, reviewed job to carry
   out. There is no `--fix`, no SQL, no connection to a geodatabase and no edit session.
 - Keys are compared verbatim. Case, leading zeros, padding and punctuation are not normalised, and
@@ -514,7 +522,9 @@ scheduled job that reads only the exit code does not take the held rows for in s
   does not test shape equality, and a buffer-containment test is not part of this.
 - A duplicated key is judged by its set of rows, matched one to one in order of appearance with the
   tolerance. It is greedy, so with a tolerance larger than the spacing of your values, a pairing
-  can come out differently from the best one. Keep the tolerance small.
+  can come out differently from the best one. That can hold back (exit 4) a group whose rows
+  do match, instead of counting it as identical. The error is conservative: it never reports a
+  false clean. Keep the tolerance small.
 - The report lists up to `--sample` keys per heading. The plan file lists all of them.
 - The delta cost rule is the one for traditional versioning in the default version. It assumes
   every touched row is a base-table row, and it does not model several edits to one row in one
@@ -523,7 +533,8 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - The small-table effect: the ceilings are fractions of the target. On a target of 41 rows 2
   percent is 0 rows, so one delete is refused. Raise `--max-delete` for a small table.
 - The source rows must be complete. The tool can see a truncated feature set only through
-  `exceededTransferLimit`. A CSV cut off by a failed export looks like a smaller table, and the
+  `exceededTransferLimit`. A response cut at the maximum record count by a server that sets no
+  such flag looks complete, so compare its row count with the layer's record count first. A CSV cut off by a failed export looks like a smaller table, and the
   delete rail is what stops it.
 - Only UTF-8 input is supported. A CSV or feature set with a byte that is not valid UTF-8, such as
   a CSV that Excel saved in cp1252, is refused with exit 3 and the file name, so two different
@@ -541,11 +552,14 @@ scheduled job that reads only the exit code does not take the held rows for in s
   `--ignore` on that column. With `--force-large` the plan lists every such row as an update.
 - `--scale` on a column whose cells are text on both sides is accepted and does nothing, with no
   warning. A non-number cell is compared as text.
+- A zero-byte target file exits 64 as a columns-not-in-the-file error, not as an empty table to
+  insert into. A zero-byte source exits 3, because the source has 0 rows.
 - An empty feature set as the target (`features: []`) exits 64 with a columns-not-in-the-file
   error, because there is no header to check the key against. A header-only CSV target is a
   target of 0 rows, so the change rail refuses a first load, and `--force-large` plans it.
-- A JSON number of more than 4300 digits is reported as not valid JSON and exits 3, because
-  Python limits the digits of an integer it converts from text.
+- A JSON integer of more than 4300 digits is reported as not valid JSON and exits 3, because
+  Python limits the digits of an integer it converts from text. A JSON float of that size, or
+  one above about 1.8e308, is refused as too large for a binary float, also exit 3.
 - A CSV that starts with a blank line is refused with exit 3 and the message names the blank
   line. A UTF-16 CSV or feature set is refused with exit 3 as not UTF-8. A semicolon CSV exits 64,
   because the key is not a column of the one-column header it reads. All are refused cleanly.
@@ -565,8 +579,9 @@ scheduled job that reads only the exit code does not take the held rows for in s
   the run with exit 70 and a traceback.
 - The change ceiling is `int(rows * 0.10)`, so a target of fewer than 10 rows allows no change and
   refuses a single edit with exit 1. Raise `--max-change` for a table that small.
-- A number with an exponent of 20 digits or more, such as `1e-99999999999999999999`, read
-  under `--scale` exits 70 with a traceback instead of being compared.
+- A number with an exponent of 19 digits or more, such as `1e-9999999999999999999`, is beyond the
+  range of the decimal context that `--scale` rounds in. It is compared as text, so two such
+  numbers that differ show as an update. An exponent of 18 digits rounds normally.
 - A dry run does not test whether `--out` can be created. A path in a missing directory shows its
   error only under `--apply`, with exit 2.
 - Line endings inside a quoted field are compared as written, so CRLF against LF is an update.
@@ -585,15 +600,15 @@ scheduled job that reads only the exit code does not take the held rows for in s
   plan file hold single-row keys only.
 - `--scale` rounds both sides. A target that holds more decimals than the scale you declare is
   rounded too, so an edit below that place stays hidden.
-- Keys and cell text print to stdout and go to the plan file as they appear in the data. The tool
-  reads no credential and sends no request, but a key column that holds sensitive text puts that
-  text in the report and the plan.
+- Keys and column names print to stdout and go to the plan file as they appear in the data. Cell
+  values are never printed or written. The tool reads no credential and sends no request, but a
+  key column that holds sensitive text puts that text in the report and the plan.
 - The Query page supports "false means no more pages" directly. That a `true` means the file holds
   the first page only is my inference from it, which the page does not state.
-- The 300,000-row timing and the 4000-rows-under-one-key figure are one-off measurements that the
+- Build notes only: the 300,000-row timing and the 4000-rows-under-one-key figure are one-off measurements that the
   self-test does not run. A later run took 4.6 seconds for 300,000 rows a side and about 4
   seconds for 4000 rows under one key, so treat both as rough.
-- The mutation figures below cannot be reproduced from this repository, because no harness ships.
+- Build notes only: the mutation figures below cannot be reproduced from this repository, because no harness ships.
   They were measured before `--scale` existed, so the `--scale` code has no mutation figure. Treat
   them as an old one-off.
 - The Esri documentation shows a failed request as an `error` object with a code and a message,
@@ -629,7 +644,7 @@ scheduled job that reads only the exit code does not take the held rows for in s
   them on exit. Only `--apply` writes a plan file for a real run.
 - A character the console cannot show prints as `?` instead of stopping the run. The plan file is
   always UTF-8.
-- It reads both files into memory and has no streaming mode. One run of 300,000 synthetic rows a
+- It reads both files into memory and has no streaming mode. Build note only: one run of 300,000 synthetic rows a
   side, three columns each, took 3.5 seconds on a Windows workstation and 2.6 seconds on an
   Ubuntu server. A later run on the same workstation took between 4.5 and 4.6 seconds. The
   self-test does not run this, and the figures are measurements, not a promise. Memory was not
@@ -638,11 +653,11 @@ scheduled job that reads only the exit code does not take the held rows for in s
   but a report pasted into a spreadsheet may read such a key as a formula.
 - The plan file is written in place with exclusive creation, not through a temporary file. A
   failed write can leave a partial file, and the exit code is 2.
-- No line is unreachable offline: coverage is 100 percent of lines and branches (1014 statements,
-  206 branches). The tool opens no
+- No line is unreachable offline: coverage is 100 percent of lines and branches (1027 statements,
+  208 branches). The tool opens no
   socket and imports no network module, so it has no network path to stub and no credential in it
   to leak. The self-test asserts that its own source imports no network module.
-- A mutation sweep of 519 mutants, run on the revision before the last two fixes, of the code outside the self-test (flipped comparisons, `and`
+- Build note only: a mutation sweep of 519 mutants, run on the revision before the last two fixes, of the code outside the self-test (flipped comparisons, `and`
   and `or` swaps, forced branches, dropped statements, constants plus one) left 4 alive. They are
   the `if __name__ == "__main__"` guard and `return _run(argv)` in `main`, each of which makes the
   script do nothing so the self-test never starts. The self-test kills the other 515.

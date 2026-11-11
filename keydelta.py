@@ -149,8 +149,13 @@ def at_scale(text, scale):
     through a binary float, so 2.675 at scale 2 is 2.68."""
     if to_float(text) is None:
         return None
-    return decimal.Decimal(text).quantize(decimal.Decimal(1).scaleb(-scale),
-                                          context=SCALE_CONTEXT)
+    try:
+        return decimal.Decimal(text).quantize(decimal.Decimal(1).scaleb(-scale),
+                                              context=SCALE_CONTEXT)
+    except decimal.InvalidOperation:
+        # An exponent of 19 or more digits is beyond the context's range. Not a number the
+        # tool can round, so the caller compares it as text.
+        return None
 
 
 def differing_full(src_cells, tgt_cells, columns, tolerance, scales=None):
@@ -471,13 +476,23 @@ def read_csv(path):
     return header, records
 
 
+def _finite_float(text):
+    """json parse_float: refuse a number too large for a binary float. float() would turn it
+    into inf, and cell_text would write the text inf, so two different huge values would
+    read as equal."""
+    number = float(text)
+    if not math.isfinite(number):
+        raise ValueError("a number too large for a binary float (%d characters)" % len(text))
+    return number
+
+
 def read_features(path):
     """(header, [(where, cells dict)]) from a saved feature set response (f=json)."""
     with open(path, "r", encoding="utf-8-sig") as handle:
         # Read outside the try: a decode failure is load()'s refusal, not "not valid JSON".
         text = handle.read()
     try:
-        doc = json.loads(text)
+        doc = json.loads(text, parse_float=_finite_float)
     except ValueError as exc:
         raise InputRefused("%s is not valid JSON: %s" % (path, exc))
     if not isinstance(doc, dict) or isinstance(doc.get("error"), dict):
@@ -1126,6 +1141,10 @@ def _self_test(tmp):
          "a feature with no attributes"),
         ("scalar.json", '{"features": [3]}', "feature 1 has no attributes",
          "a feature that is not an object"),
+        ("huge_exp.json", '{"features": [{"attributes": {"K": 1, "V": 1e400}}]}',
+         "too large for a binary float", "1e400 read as inf  <-- pinned defect"),
+        ("huge_digits.json", '{"features": [{"attributes": {"K": 1, "V": %s.5}}]}' % ("1" * 5000),
+         "too large for a binary float", "a 5000-digit float read as inf  <-- pinned defect"),
     ]
     for name, text, needle, what in cases:
         message = []
@@ -1293,6 +1312,11 @@ def _self_test(tmp):
     check(written.get("updates") == [{"key": ["S05"], "columns": ["NAME"]}]
           and written.get("deletes") == [["S99"]] and written.get("held")[0]["key"] == ["S02"],
           "and the file holds the update with its column, the delete and the held key")
+    nochange_out = os.path.join(tmp, "nochange.json")
+    code, so, se = run_cli(base + ["--out", nochange_out, "--apply"])
+    check(code == 0 and "wrote " in so and so.endswith("VERDICT: NO CHANGE, nothing to write.\n")
+          and os.path.exists(nochange_out),
+          "--apply on a plan with no change still writes the file, then says nothing to write")
     code, so, se = run_cli([src, tgt2, "--key", "SEG", "--ignore", "EDITED",
                             *loose, "--out", out,
                             "--apply"])
@@ -1609,6 +1633,11 @@ def _self_test(tmp):
     check(option_error(_parse(["a.csv", "b.csv", "--key", "K", "--scale", "V=2"])) is None
           and "COLUMN=N" in option_error(_parse(["a.csv", "b.csv", "--key", "K", "--scale", "V"])),
           "--scale is checked with the other options")
+    tiny, tiny2 = "1e-" + "9" * 19, "2e-" + "9" * 19
+    check(at_scale(tiny, 2) is None and at_scale("1e-" + "9" * 18, 2) == decimal.Decimal("0.00")
+          and differing_full({"V": tiny}, {"V": tiny2}, ["V"], 0, {"V": 2}) == (["V"], False, False),
+          "a 19-digit exponent under --scale is compared as text, not a crash  "
+          "<-- pinned defect")
 
     # ---- storage scale through main, on real files
     def scale_row(i, name=None, length=None):
