@@ -352,7 +352,7 @@ VERDICT: PLAN READY, 3 update(s), 0 insert(s), 0 delete(s), 0 held back.
 
 `S30` is not an update, because `130.504` stores as `130.50`. `S31` is one, because `131.506`
 stores as `131.51`. A tolerance of 0.01 cannot tell these two apart. Run on the same files with
-`--tolerance 0.01 --max-change 0.5` it plans two updates, `S07` and `S21`, and hides `S31`:
+`--ignore EDITED_ON --tolerance 0.01 --max-change 0.5` it plans two updates, `S07` and `S21`, and hides `S31`:
 a real edit that would have changed the stored value.
 
 The rules, each pinned in the self-test:
@@ -596,8 +596,11 @@ scheduled job that reads only the exit code does not take the held rows for in s
   unchanged. The exit code and the plan file are not affected, so read the exit code.
 - A JSON number with more than 17 significant digits is parsed to a binary float before `--scale`
   rounds it or the comparison runs, so digits past the float's precision are lost. For example,
-  `2.6749999999999999999` is read as 2.675 and rounds to 2.68 at scale 2. Services that emit
-  doubles write at most 17 digits, so this affects only hand-edited or high-precision JSON.
+  `2.6749999999999999999` and the 17-digit `2.6749999999999998` are both read as 2.675 and round to
+  2.68 at scale 2, where the decimal text rounds to 2.67. I found no Esri page that says how many
+  digits a service writes, so do not assume this affects only hand-edited JSON.
+- Only the JSON boolean `true` in `exceededTransferLimit` refuses a file. The string `"true"` is ignored.
+- A repeated attribute name inside one JSON feature keeps the last value, with no warning.
 - The `--apply` write path was verified by the self-test assertions and again by live command
   lines: a write-flag prefix such as `--ap` or `--apply=1` exits 64 and writes nothing, and a
   second `--apply` onto an existing plan exits 2 and leaves the first plan unchanged.
