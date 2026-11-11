@@ -637,7 +637,7 @@ scheduled job that reads only the exit code does not take the held rows for in s
   rounded too, so an edit below that place stays hidden.
 - Keys and column names print to stdout and go to the plan file as they appear in the data. Cell
   values are never printed or written. The tool reads no credential and sends no request, but a
-  key column that holds sensitive text puts that text in the report and the plan.
+  key column that holds sensitive text puts that text in the report and the plan. The plan file is created with the process's default permissions, so anyone who can read it can read every key. Restrict the folder if the keys are sensitive.
 - The Query page supports "false means no more pages" directly. That a `true` means the file holds
   the first page only is my inference from it, which the page does not state.
 - Build notes only: the 300,000-row timing and the 4000-rows-under-one-key figure are one-off measurements that the
@@ -659,7 +659,7 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - A scheduled job that reuses one `--out` path exits 2 on its second `--apply` run, because the
   plan file is created exclusively. Give each `--apply` run a new `--out` path.
 - A traceback printed on an exit 70 crash holds the local script path and the input paths as
-  typed. It holds no credential. Strip the paths before pasting it into a public issue.
+  typed. The tool reads no credential, but the exception message can echo a key or cell text from the input. Strip the paths and any such text before pasting it into a public issue.
 - On a console that cannot show a character, two keys that differ only in such characters print
   alike, both with a `?`. The plan file keeps the exact keys, so read the plan file.
 - The demo tables in this README are not shipped. The self-test builds the same data, so the demo
@@ -706,6 +706,12 @@ scheduled job that reads only the exit code does not take the held rows for in s
   test the tool against a live geodatabase or a SQL Server instance, and the cost line was not
   compared with real delta-table counts. The scale rounding is checked against the rule on the
   pages, not against a database that holds a rounded column.
+- A scale written with a leading zero, such as `V=02`, is read as the plain number 2.
+- The documentation quotes in this README were checked against saved copies of the Esri and Microsoft pages and may have changed since. The statement that the Table Compare page does not mention precision, scale or decimal places was checked the same way, not on a live fetch.
+- A dry run whose `--out` names a file that already exists prints `Re-run with --apply`, but the `--apply` run then exits 2, because the plan file is created exclusively. A dry run does not test `--out`.
+- Name an ordinary new file in `--out`. A reserved Windows device name such as `NUL` or `CON` was not tested.
+- A feature set whose `error` value is a string, not an object, is not refused as an error response if it also has a `features` list. Only an `error` object is refused.
+- SOURCE and TARGET may name the same file with no warning. The run reports NO CHANGE.
 
 ## Contributing
 
