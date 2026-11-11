@@ -405,11 +405,13 @@ The tool refuses before it plans, and it refuses a plan it has made.
 - A CSV row whose field count differs from the header. A cell beyond the header would be dropped, so
   a real edit in it would show as `NO CHANGE`. The row is refused with its line number, exit 3.
 - A source with fewer rows than `--min-rows`. An empty source plans to delete the target.
-- A feature set whose `exceededTransferLimit` is `true`. Esri's query documentation states only
-  the `false` case: there are no more pages to fetch
+- A feature set whose `exceededTransferLimit` is `true`. Esri's query documentation says there are
+  no more pages to fetch when `exceededTransferLimit: false` is present
   ([Query](https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/)).
-  Reading a `true` as "the file holds a partial page" is my inference from that. A plan from a
-  partial file would delete every row it did not return, so the tool refuses it.
+  It mentions `true` only in the `returnExceededLimitFeatures` parameter, which says features are
+  returned even when the results include `exceededTransferLimit` as `true`. It does not say what a
+  `true` means for a saved file. Reading it as "the file holds a partial page" is my inference.
+  A plan from a partial file would delete every row it did not return, so the tool refuses it.
 - A JSON number too large for a binary float, such as `1e400` or a float of 5000 digits. Python
   reads it as `inf`, and two different huge values would then print as the same text and show as
   `NO CHANGE`. The file is refused, exit 3.
@@ -439,7 +441,7 @@ REFUSED   no key is on both sides, so every target row would be deleted and ever
 
 REFUSED   60 deletes exceeds the ceiling of 1 (2% of 60 target rows). ...
 
-REFUSED   120 changed rows exceeds the ceiling of 6 (10% of 60 target rows). ...
+REFUSED   119 changed rows exceeds the ceiling of 6 (10% of 60 target rows). ...
 
 VERDICT: REFUSED, 3 rail(s) tripped. Do not apply this plan.
 ```
@@ -578,8 +580,11 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - A closed stdout pipe can end the run with exit 70 on some hosts; read the exit code, not the
   report. A `| head -1` in Git Bash on Windows 3.13.2 gave exit 4 with no traceback, because the
   output was small.
-- An unclosed CSV quote or a NUL byte is reported by the `csv` module. It exits 2 with an error
-  line and no `VERDICT` line, while other malformed CSV rows exit 3.
+- An unclosed CSV quote is reported by the `csv` module. It exits 2 with an error line and no
+  `VERDICT` line, while other malformed CSV rows exit 3. A NUL byte depends on the interpreter.
+  Python 3.9.25 raises `line contains NUL` and the run exits 2. Python 3.12 and 3.13 read the
+  NUL as ordinary data, so the run compares it and ends with a normal `VERDICT`. The `csv` module
+  changelog places that change at 3.11; I measured 3.9.25, 3.12.3 and 3.13.2 only.
 - A JSON `NaN` or `Infinity` literal is read as the text `nan` or `inf`, so it compares equal to
   the same text in a CSV. Esri does not emit these literals.
 - A blank line between CSV data rows is skipped without a refusal.
@@ -593,11 +598,17 @@ scheduled job that reads only the exit code does not take the held rows for in s
   rounds it or the comparison runs, so digits past the float's precision are lost. For example,
   `2.6749999999999999999` is read as 2.675 and rounds to 2.68 at scale 2. Services that emit
   doubles write at most 17 digits, so this affects only hand-edited or high-precision JSON.
-- The `--apply` write path was verified through the self-test assertions only: no write without
-  `--apply`, no write on a refusal and no overwrite of an existing plan file. A manual run of a
-  live `--apply` command line was not done in the last audit.
-- The Python 3.9.25 self-test count was not re-run on Ubuntu, because that host has only 3.12.3.
-  The 3.9 count was measured on Windows 3.9.25.
+- The `--apply` write path was verified by the self-test assertions and again by live command
+  lines: a write-flag prefix such as `--ap` or `--apply=1` exits 64 and writes nothing, and a
+  second `--apply` onto an existing plan exits 2 and leaves the first plan unchanged.
+- The module docstring's exit-3 list is shorter than the one above. It leaves out a repeated CSV
+  column name and a JSON number too large for a binary float.
+- A JSON integer of more than 4300 digits exits 3 with Python's own message, which suggests
+  `sys.set_int_max_str_digits()`. That is a Python call, not something a command line can do.
+- A CSV field of more than 131072 characters exits 2 with `field larger than field limit
+  (131072)`. The message does not name the file.
+- An unexpected `ValueError` raised inside the comparison would be reported as exit 64, a usage
+  error, instead of exit 70.
 - The change ceiling is `int(rows * 0.10)`, so a target of fewer than 10 rows allows no change and
   refuses a single edit with exit 1. Raise `--max-change` for a table that small.
 - A number with an exponent of 19 digits or more, such as `1e-9999999999999999999`, is beyond the
@@ -628,14 +639,16 @@ scheduled job that reads only the exit code does not take the held rows for in s
   the first page only is my inference from it, which the page does not state.
 - Build notes only: the 300,000-row timing and the 4000-rows-under-one-key figure are one-off measurements that the
   self-test does not run. A later run took 4.6 seconds for 300,000 rows a side and about 4
-  seconds for 4000 rows under one key, so treat both as rough.
+  seconds for 4000 rows under one key. A third audit run took about 2 seconds for the 4000-row
+  case and 3.7 seconds for the 300,000-row case, so treat all of them as rough.
 - Build notes only: the mutation figures below cannot be reproduced from this repository, because no harness ships.
   They were measured before `--scale` existed, so the `--scale` code has no mutation figure. Treat
   them as an old one-off.
 - The Esri documentation shows a failed request as an `error` object with a code and a message,
   but I could not find that on the Query page or the feature service error codes page. The tool
   does not depend on it.
-- Esri's Query page states only the `false` case of `exceededTransferLimit`. A `true` can also mean
+- Esri's Query page defines the `false` case of `exceededTransferLimit` for paging. It does not
+  define a `true` in a saved file. A `true` can also mean
   the result was cut at the service's maximum record count without paging. Either way the file is
   partial, so the refusal is right, but the reading is an inference.
 - A `--tolerance` run prints only the count of rows it hid as noise, not the tolerance value, so
