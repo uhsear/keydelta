@@ -49,29 +49,32 @@ PASS  the held key is not inserted, updated or deleted, so the published row sta
 ...
 PASS  a 1e-9 difference is suppressed and listed, not rewritten every night  <-- pinned defect
 ...
-PASS  an edit of 0.006 that stores as 10.01 is a change at scale 2, though a tolerance of 0.01 would hide it  <-- pinned defect
-...
-PASS  without --scale every float reads as an edit and the change rail refuses  <-- pinned defect
-...
-PASS  --scale on a column the files do not hold is exit 64, not a silent no-op  <-- pinned defect
-...
 PASS  two populated tables with no shared key are refused by name  <-- pinned defect
-...
-PASS  refused: a truncated first page  <-- pinned defect
-...
-PASS  a repeated CSV header is refused, not read as NO CHANGE  <-- pinned defect
-...
-PASS  an unquoted comma is refused with exit 3, not read as NO CHANGE  <-- pinned defect
 ...
 PASS  held keys beside a change still give a plan but exit 4, and a tripped rail still wins  <-- pinned defect
 ...
-PASS  --key @geometry on a CSV is exit 64, not a crash  <-- pinned defect
+PASS  refused: a truncated first page  <-- pinned defect
 ...
 PASS  --ap is refused, not read as a longer flag  <-- pinned defect
 ...
 PASS  --apply never replaces a plan file that exists, and the verdict still prints  <-- pinned defect
 ...
 PASS  a refused plan writes no file even with --apply  <-- pinned defect
+...
+PASS  a CSV that is not UTF-8 is refused with exit 3, not read as NO CHANGE  <-- pinned defect
+PASS  a feature set that is not UTF-8 is refused as bad encoding, not as bad JSON  <-- pinned defect
+PASS  a date as epoch milliseconds against text is a refusal that names the column  <-- pinned defect
+...
+PASS  an unquoted comma is refused with exit 3, not read as NO CHANGE  <-- pinned defect
+PASS  a repeated CSV header is refused, not read as NO CHANGE  <-- pinned defect
+...
+PASS  --key @geometry on a CSV is exit 64, not a crash  <-- pinned defect
+...
+PASS  an edit of 0.006 that stores as 10.01 is a change at scale 2, though a tolerance of 0.01 would hide it  <-- pinned defect
+...
+PASS  without --scale every float reads as an edit and the change rail refuses  <-- pinned defect
+...
+PASS  --scale on a column the files do not hold is exit 64, not a silent no-op  <-- pinned defect
 ...
 PASS  an unexpected exception exits 70, not the 1 that means a rail refused  <-- pinned defect
 ...
@@ -80,10 +83,10 @@ PASS  and raises() accepts the exception it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-252 assertions, 0 failed
+257 assertions, 0 failed
 ```
 
-The full run prints all 252 assertions. Each `...` line above is where this block is cut.
+The full run prints all 257 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
 
 ## What already exists
 
@@ -102,7 +105,7 @@ Diffing two tables on a key is a solved problem, and these do it well.
   tool sorts both tables on a field you name and, by default, stops at the first difference. Its
   page says the compare tools do not try to find the next matching records after an added or
   deleted record. It has an Attribute Tolerance parameter that sets, per numeric field, "the
-  range in which attribute values are considered equal". That is an absolute range. The page
+  range in which attribute values are considered equal". The page
   does not mention precision, scale or decimal places, so rounding to a stored scale is not
   what it offers.
 
@@ -119,10 +122,10 @@ one, a set of buttons, so the name is not taken by another tool for this.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Each snapshot is a CSV, or a saved feature set (`.json`) from a layer query.
 
-The self-test prints the same 252 assertions on Windows (Python 3.13.2 and 3.9.25) and on
+The self-test prints the same 257 assertions on Windows (Python 3.13.2 and 3.9.25) and on
 Ubuntu (Python 3.12.3 and 3.9.25). The four outputs are identical line for line once the Windows
 carriage returns are removed (the same MD5 of the output on all four).
-`coverage run --branch keydelta.py --self-test` reports 100 percent of 961 statements and 198
+`coverage run --branch keydelta.py --self-test` reports 100 percent of 995 statements and 204
 branches.
 
 ```
@@ -391,6 +394,9 @@ The tool refuses before it plans, and it refuses a plan it has made.
   lines are named.
 - A CSV that repeats a column name. Only the last column of that name would be read, so a change
   in the earlier one would show as `NO CHANGE`. The file is refused and the names are listed.
+- A file with a byte that is not valid UTF-8. Replacing the byte would turn two different accented
+  letters into the same character, so a real edit between them would show as `NO CHANGE`. The
+  file is refused by name, exit 3.
 - A CSV row whose field count differs from the header. A cell beyond the header would be dropped, so
   a real edit in it would show as `NO CHANGE`. The row is refused with its line number, exit 3.
 - A source with fewer rows than `--min-rows`. An empty source plans to delete the target.
@@ -515,11 +521,27 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - The source rows must be complete. The tool can see a truncated feature set only through
   `exceededTransferLimit`. A CSV cut off by a failed export looks like a smaller table, and the
   delete rail is what stops it.
-- Only UTF-8 CSV is supported. Other bytes are decoded lossily, so two different keys can
-  collapse into one, and so can two different values. A CSV in cp1252, which Excel writes by
-  default, that changes `Caf` plus an acute `e` to `Caf` plus a grave `e` reports `NO CHANGE` with
-  exit 0. Save as UTF-8 first. A CSV row whose field count differs from the header, such as an unquoted
-  comma, is refused with exit 3. A UTF-8 byte order mark is removed.
+- Only UTF-8 input is supported. A CSV or feature set with a byte that is not valid UTF-8, such as
+  a CSV that Excel saved in cp1252, is refused with exit 3 and the file name, so two different
+  accented letters cannot both turn into one replacement character and hide an edit. Save it as
+  UTF-8 first. A CSV row whose field count differs from the header, such as an unquoted comma, is
+  refused with exit 3. A UTF-8 byte order mark is removed. A cp1252 file whose bytes happen to be
+  valid UTF-8 cannot be told apart, which is rare.
+- Excel often leaves trailing rows of only commas. Such a row has a blank key, so the whole file is
+  refused with exit 3 instead of the row being skipped.
+- Keys that differ only by Unicode normalisation form, composed against decomposed accents, are
+  different keys. They show as an insert plus a delete.
+- A date is epoch milliseconds in a saved feature set and formatted text in a CSV export, so a
+  JSON against CSV run reads every date as an edit. The change rail refuses it and the message
+  names the column that differs on every updated row. Export both sides the same way or use
+  `--ignore` on that column. With `--force-large` the plan lists every such row as an update.
+- `--scale` on a column whose cells are text on both sides is accepted and does nothing, with no
+  warning. A non-number cell is compared as text.
+- An empty feature set as the target (`features: []`) exits 64 with a columns-not-in-the-file
+  error, because there is no header to check the key against. A header-only CSV target plans a
+  first load.
+- A JSON number of more than 4300 digits is reported as not valid JSON and exits 3, because
+  Python limits the digits of an integer it converts from text.
 - A CSV that starts with a blank line, uses semicolons or is UTF-16 exits 64, because the header
   is not read as columns. A UTF-16 feature set is refused too. All are refused cleanly.
 - The parser takes two optional positional files. Whether `SOURCE --key K TARGET` (an option
@@ -555,6 +577,12 @@ scheduled job that reads only the exit code does not take the held rows for in s
   self-test does not run. A later run took 4.6 seconds for 300,000 rows a side and about 4
   seconds for 4000 rows under one key, so treat both as rough.
 - The mutation figures below cannot be reproduced from this repository, because no harness ships.
+- The demo tables in this README are not shipped. The self-test builds the same data, so the demo
+  output can be reproduced only through it, not by running the four files on separate tables.
+- The GitHub name search under "What already exists" has no recorded date. Repeat it before you
+  rely on it.
+- Branch coverage was measured on Windows with Python 3.13.2. It was not measured on Linux,
+  where `coverage` is not installed.
 - A plan with changes and held-back keys prints `PLAN READY` and exits 4. The plan is ready for
   the other rows, and the held rows stay stale in the published copy. A job that applies the plan
   should treat 4 as "apply, then send a person to the held keys".
@@ -577,8 +605,8 @@ scheduled job that reads only the exit code does not take the held rows for in s
   but a report pasted into a spreadsheet may read such a key as a formula.
 - The plan file is written in place with exclusive creation, not through a temporary file. A
   failed write can leave a partial file, and the exit code is 2.
-- No line is unreachable offline: coverage is 100 percent of lines and branches (961 statements,
-  198 branches). The tool opens no
+- No line is unreachable offline: coverage is 100 percent of lines and branches (995 statements,
+  204 branches). The tool opens no
   socket and imports no network module, so it has no network path to stub and no credential in it
   to leak. The self-test asserts that its own source imports no network module.
 - A mutation sweep of 519 mutants, run on the revision before the last two fixes, of the code outside the self-test (flipped comparisons, `and`

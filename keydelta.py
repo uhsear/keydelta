@@ -273,6 +273,22 @@ def delta_cost(plan):
     return keyed, plan["source_rows"] + plan["target_rows"]
 
 
+def always_changed_hint(updates):
+    """A sentence naming the columns that differ on every updated row, or "". One column that
+    differs on every row is usually a representation clash, such as a date stored as epoch
+    milliseconds in a JSON file and as formatted text in a CSV, not 20 real edits."""
+    if len(updates) < 2:
+        return ""
+    every = set(updates[0]["columns"])
+    for update in updates[1:]:
+        every &= set(update["columns"])
+    if not every:
+        return ""
+    return (" Column(s) %s differ on every updated row. A date stored as epoch milliseconds on "
+            "one side and as text on the other reads this way. Export both sides the same way "
+            "or add --ignore." % ", ".join(sorted(every)))
+
+
 def guard(plan, force_large, max_change, max_delete, max_duplicates):
     """Reasons to refuse the plan. An empty list means no rail tripped."""
     problems = []
@@ -310,8 +326,9 @@ def guard(plan, force_large, max_change, max_delete, max_duplicates):
     if total > change_ceiling:
         problems.append(
             "%d changed rows exceeds the ceiling of %d (%.0f%% of %s). That is "
-            "more likely a bad read than real editing. Rerun with --force-large if it is "
-            "intended." % (total, change_ceiling, max_change * 100, basis))
+            "more likely a bad read than real editing.%s Rerun with --force-large if it is "
+            "intended." % (total, change_ceiling, max_change * 100, basis,
+                           always_changed_hint(plan["updates"])))
     return problems
 
 
@@ -420,7 +437,7 @@ def plan_document(plan, keys, columns, problems):
 def read_csv(path):
     """(header, [(where, cells dict)]). where names the line a record starts on."""
     records = []
-    with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
         # strict: an unclosed quote is an error, not one cell that swallows the rest of the file.
         reader = csv.reader(handle, strict=True)
         header = next(reader, [])
@@ -451,11 +468,13 @@ def read_csv(path):
 
 def read_features(path):
     """(header, [(where, cells dict)]) from a saved feature set response (f=json)."""
-    with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
-        try:
-            doc = json.load(handle)
-        except ValueError as exc:
-            raise InputRefused("%s is not valid JSON: %s" % (path, exc))
+    with open(path, "r", encoding="utf-8-sig") as handle:
+        # Read outside the try: a decode failure is load()'s refusal, not "not valid JSON".
+        text = handle.read()
+    try:
+        doc = json.loads(text)
+    except ValueError as exc:
+        raise InputRefused("%s is not valid JSON: %s" % (path, exc))
     if not isinstance(doc, dict) or isinstance(doc.get("error"), dict):
         raise InputRefused(
             "%s is an error response or not a feature set. A file with an error object holds "
@@ -491,9 +510,15 @@ def read_features(path):
 
 def load(path):
     """Read one snapshot. A .json path is a feature set response, anything else is a CSV."""
-    if path.lower().endswith(".json"):
-        return read_features(path)
-    return read_csv(path)
+    try:
+        return read_features(path) if path.lower().endswith(".json") else read_csv(path)
+    except UnicodeDecodeError as exc:
+        # Replacing the bad bytes would make two different accented letters compare equal, so a
+        # real edit could read as NO CHANGE. Refuse instead.
+        raise InputRefused(
+            "%s is not valid UTF-8 (byte %d is not). Decoding it with replacement characters "
+            "would hide edits between different accented letters. Save it as UTF-8 first, for "
+            "example CSV UTF-8 in Excel." % (path, exc.start))
 
 
 def check_columns(header, keys, ignore, side):
@@ -950,13 +975,13 @@ def _self_test(tmp):
 
     check(rails() == [], "a plan with no change trips no rail")
     check("(2% of 1000 target rows)" in rails(deletes=[["k"]] * 21)[0]
-          and "(10% of 1000 target rows)" in rails(updates=[{}] * 101)[0],
+          and "(10% of 1000 target rows)" in rails(updates=[{"columns": ["V"]}] * 101)[0],
           "a rail message names the percent and the target size it was figured from")
     check(guard(dict(big, target_rows=0, shared_keys=0, inserts=[["k"]]), False, 1.0, 1.0, 50)
           == [], "an empty target counts as one row, so one insert fits a ceiling of 100%")
     check(rails(deletes=[["k"]] * 20) == [] and len(rails(deletes=[["k"]] * 21)) == 1,
           "deletes at exactly 2% pass and one more trips the delete rail")
-    check(len(rails(updates=[{}] * 101)) == 1 and rails(updates=[{}] * 100) == [],
+    check(len(rails(updates=[{"columns": ["V"]}] * 101)) == 1 and rails(updates=[{"columns": ["V"]}] * 100) == [],
           "changes at exactly 10% pass and one more trips the change rail")
     check(len(rails(deletes=[["k"]] * 200)) == 2,
           "a plan can trip both rails and each is reported")
@@ -1304,6 +1329,45 @@ def _self_test(tmp):
     check(code == 0 and "delete       40" in so, "--min-rows 0 plans the deletion of the target")
     code, so, se = run_cli([make("blank.csv", "SEG,NAME,LEN,EDITED\n,x,1,2\n"), tgt, "--key", "SEG"])
     check(code == 3 and "blank key" in so, "a blank key is refused with exit 3, never skipped")
+    # A cp1252 file (Excel's default) decoded with replacement characters turned two different
+    # accented letters into the same U+FFFD, so a real edit read as NO CHANGE with exit 0.
+    cp_pair = []
+    for name, letter in (("cp_s.csv", b"\xf1"), ("cp_t.csv", b"\xf6")):
+        cp_pair.append(os.path.join(tmp, name))
+        with open(cp_pair[-1], "wb") as handle:
+            handle.write(b"ID,NAME\n1,Pe" + letter + b"a\n")
+    code, so, se = run_cli(cp_pair + ["--key", "ID"])
+    check(code == 3 and "cp_s.csv is not valid UTF-8" in so and "NO CHANGE" not in so,
+          "a CSV that is not UTF-8 is refused with exit 3, not read as NO CHANGE  "
+          "<-- pinned defect")
+    bad_json = os.path.join(tmp, "cp.json")
+    with open(bad_json, "wb") as handle:
+        handle.write(b'{"features": [{"attributes": {"ID": 1, "NAME": "Pe\xf1a"}}]}')
+    texts = []
+    try:
+        load(bad_json)
+    except InputRefused as exc:
+        texts.append(str(exc))
+    check(len(texts) == 1 and "not valid UTF-8" in texts[0] and "not valid JSON" not in texts[0],
+          "a feature set that is not UTF-8 is refused as bad encoding, not as bad JSON  "
+          "<-- pinned defect")
+    # A saved feature set holds a date as epoch milliseconds, a CSV export as formatted text, so
+    # every row reads as an update. The rail refuses it, and the message names the column.
+    mixed_src = make("date_s.json", json.dumps({"features": [
+        {"attributes": {"ID": i, "NAME": "n", "EDITED": 1767225600000 + i}} for i in range(1, 41)]}))
+    mixed_tgt = make("date_t.csv", "ID,NAME,EDITED\n" + "".join(
+        "%d,n,2026-01-01\n" % i for i in range(1, 41)))
+    code, so, se = run_cli([mixed_src, mixed_tgt, "--key", "ID"])
+    check(code == 1 and "Column(s) EDITED differ on every updated row" in so,
+          "a date as epoch milliseconds against text is a refusal that names the column  "
+          "<-- pinned defect")
+    code, so, se = run_cli([mixed_src, mixed_tgt, "--key", "ID", "--ignore", "EDITED"])
+    check(code == 0 and "NO CHANGE" in so, "--ignore on that column plans no change")
+    check(always_changed_hint([]) == "" and always_changed_hint([{"columns": ["A"]}]) == ""
+          and always_changed_hint([{"columns": ["A"]}, {"columns": ["B"]}]) == ""
+          and "Column(s) A, B differ" in always_changed_hint(
+              [{"columns": ["B", "A", "C"]}, {"columns": ["A", "B"]}]),
+          "the hint needs two updates and names only the columns every update shares")
     pad = "".join("p%d,x" % k + "\n" for k in range(40))
     code, so, se = run_cli([make("ucs.csv", "ID,NAME\n1,Main St, Apt 2\n" + pad),
                             make("uct.csv", "ID,NAME\n1,Main St, Apt 3\n" + pad), "--key", "ID"])
