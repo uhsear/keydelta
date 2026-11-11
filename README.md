@@ -115,9 +115,9 @@ Diffing two tables on a key is a solved problem, and these do it well.
 
 I did not run csvdiff or daff for this README. Their pages say nothing about a key that two rows
 share, so I make no claim about what they do with one. I also found no page that describes pricing
-the diff against the delete-all, or listing the rows a duplicate key held back. This tool adds
-those four things: the duplicate handling, the tolerance, the comparison at a declared storage
-scale, and the refusals. A search of GitHub
+the diff against the delete-all, listing the rows a duplicate key held back, or comparing at a
+declared decimal scale. This tool does those three things. Table Compare already has a tolerance,
+so the tolerance is not new here. A search of GitHub
 for the name `keydelta` on the day this was written found this repository and one unrelated
 one, a set of buttons, so the name is not taken by another tool for this.
 
@@ -167,7 +167,7 @@ python keydelta.py response.json target.csv --key SEG_ID
 | `--sample` | `10` | How many keys to list under each heading. `0` lists none. |
 | `--out` | off | Path for the plan file, a new JSON file. Needs `--apply` to be written. |
 | `--apply` | off | Write `--out`. Without it nothing is written. |
-| `--self-test` | off | Run the assertions and exit. Other known flags are ignored, an unknown flag exits 64. |
+| `--self-test` | off | Run the assertions and exit. Other known flags are ignored. An unknown flag, or a known flag with a malformed value such as `--tolerance abc`, exits 64 before any assertion runs. |
 
 Every flag must be spelled in full. The parser sets `allow_abbrev=False`, so `--ap` is refused
 with exit 64 instead of being read as `--apply`, and `--tol` is refused instead of being read as
@@ -434,7 +434,7 @@ REFUSED   no key is on both sides, so every target row would be deleted and ever
 
 REFUSED   60 deletes exceeds the ceiling of 1 (2% of 60 target rows). ...
 
-REFUSED   119 changed rows exceeds the ceiling of 6 (10% of 60 target rows). ...
+REFUSED   120 changed rows exceeds the ceiling of 6 (10% of 60 target rows). ...
 
 VERDICT: REFUSED, 3 rail(s) tripped. Do not apply this plan.
 ```
@@ -555,7 +555,7 @@ scheduled job that reads only the exit code does not take the held rows for in s
   first.
 - A group of N rows under one key is compared in time that grows with N squared. With a
   low-cardinality column as `--key` and the two files in different orders, 4000 rows under one
-  key took about 2 seconds here, and tens of thousands would run for minutes before any rail can
+  key took about 4 seconds here, and tens of thousands would run for minutes before any rail can
   fire. Use a real key.
 - A JSON file nested hundreds of thousands of levels deep raises `RecursionError`, and a huge
   integer in a shape can raise `OverflowError`. Both exit 70, a fault in the tool, not a finding.
@@ -565,7 +565,7 @@ scheduled job that reads only the exit code does not take the held rows for in s
   the run with exit 70 and a traceback.
 - The change ceiling is `int(rows * 0.10)`, so a target of fewer than 10 rows allows no change and
   refuses a single edit with exit 1. Raise `--max-change` for a table that small.
-- A number with an exponent of about 18 digits or more, such as `1e-99999999999999999999`, read
+- A number with an exponent of 20 digits or more, such as `1e-99999999999999999999`, read
   under `--scale` exits 70 with a traceback instead of being compared.
 - A dry run does not test whether `--out` can be created. A path in a missing directory shows its
   error only under `--apply`, with exit 2.
@@ -594,6 +594,22 @@ scheduled job that reads only the exit code does not take the held rows for in s
   self-test does not run. A later run took 4.6 seconds for 300,000 rows a side and about 4
   seconds for 4000 rows under one key, so treat both as rough.
 - The mutation figures below cannot be reproduced from this repository, because no harness ships.
+  They were measured before `--scale` existed, so the `--scale` code has no mutation figure. Treat
+  them as an old one-off.
+- The Esri documentation shows a failed request as an `error` object with a code and a message,
+  but I could not find that on the Query page or the feature service error codes page. The tool
+  does not depend on it.
+- Esri's Query page states only the `false` case of `exceededTransferLimit`. A `true` can also mean
+  the result was cut at the service's maximum record count without paging. Either way the file is
+  partial, so the refusal is right, but the reading is an inference.
+- A `--tolerance` run prints only the count of rows it hid as noise, not the tolerance value, so
+  the report does not state the tolerance used. Keep the value in your own run log.
+- A scheduled job that reuses one `--out` path exits 2 on its second `--apply` run, because the
+  plan file is created exclusively. Give each `--apply` run a new `--out` path.
+- A traceback printed on an exit 70 crash holds the local script path and the input paths as
+  typed. It holds no credential. Strip the paths before pasting it into a public issue.
+- On a console that cannot show a character, two keys that differ only in such characters print
+  alike, both with a `?`. The plan file keeps the exact keys, so read the plan file.
 - The demo tables in this README are not shipped. The self-test builds the same data, so the demo
   output can be reproduced only through it, not by running the four files on separate tables.
 - The GitHub name search under "What already exists" has no recorded date. Repeat it before you
