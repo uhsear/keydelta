@@ -83,6 +83,10 @@ PASS  without --scale every float reads as an edit and the change rail refuses  
 ...
 PASS  --scale on a column the files do not hold is exit 64, not a silent no-op  <-- pinned defect
 ...
+PASS  a JSON float keeps its text only when a binary float would change the number  <-- pinned defect
+PASS  a 17-digit JSON value rounds from its text, not from the float's repr  <-- pinned defect
+PASS  a JSON 2.6749999999999998 against a stored 2.68 is an update, not a false clean  <-- pinned defect
+...
 PASS  an unexpected exception exits 70, not the 1 that means a rail refused  <-- pinned defect
 ...
 PASS  check() and raises() really do record a failure  <-- pinned defect
@@ -90,10 +94,10 @@ PASS  and raises() accepts the exception it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-268 assertions, 0 failed
+272 assertions, 0 failed
 ```
 
-The full run prints all 268 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
+The full run prints all 272 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
 
 ## What already exists
 
@@ -129,10 +133,11 @@ one, a set of buttons, so the name is not taken by another tool for this.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Each snapshot is a CSV, or a saved feature set (`.json`) from a layer query.
 
-The self-test prints the same 268 assertions on Windows (Python 3.13.2 and 3.9.25) and on
-Ubuntu (Python 3.12.3 and 3.9.25). The four outputs are identical line for line once the Windows
+The self-test prints the same 272 assertions on Windows (Python 3.13.2 and 3.9.25) and on
+Ubuntu (Python 3.12.3 and 3.9.25). Windows `py -3.9` finds no interpreter on my machine, so I ran 3.9.25 from a `uv` install
+(`uv python install 3.9`). The four outputs are identical line for line once the Windows
 carriage returns are removed (the same MD5 of the output on all four).
-`coverage run --branch keydelta.py --self-test` reports 100 percent of 1031 statements and 210
+`coverage run --branch keydelta.py --self-test` reports 100 percent of 1054 statements and 212
 branches.
 
 ```
@@ -209,6 +214,7 @@ For each key, the tool looks at the rows each side holds under it:
 | One row on each side, every difference is inside the tolerance | no change, counted as noise |
 | One row in the source, none in the target | `insert` |
 | One row in the target, none in the source | `delete` |
+| One row on each side, every difference is the same number at the declared `--scale` | no change, counted as same at storage scale |
 | More than one row on either side, the same rows on both | no change |
 | More than one row on either side, anything else | `held back`, left as published |
 
@@ -297,11 +303,13 @@ both. It is an estimate from that rule, not a measurement of any table.
 A column that the published copy stores at fixed decimals cannot hold the full float of the
 source. `--scale LEN_FT=2` tells the tool that LEN_FT stores two decimal places. For that column
 two numbers are equal when they round to the same value at two places. The tool rounds the text as
-written, half away from zero, using Python's `decimal` module, never a binary float.
+written, half away from zero, using Python's `decimal` module, never a binary float. A JSON number
+is parsed to a float first. When that float does not hold the number the file wrote, as with
+`2.6749999999999998`, which reads back as `2.675`, the tool rounds the written text instead.
 
 The demo tables are synthetic. `source.csv` and `target.csv` hold 60 segments each. The source
 holds LEN_FT as a full float, such as `101.5000000004`, and the target holds `101.50`. The
-differences, all of them seeded: `S07` has a new name in the source, `S21` is `121.634` against a
+differences, all of them seeded: `S07` has a new name in the target, `S21` is `121.634` against a
 stored `121.50`, `S30` is `130.504` against `130.50`, and `S31` is `131.506` against `131.50`.
 Without `--scale`:
 
@@ -513,8 +521,9 @@ scheduled job that reads only the exit code does not take the held rows for in s
   disappears at scale 2. A scale higher than the column stores leaves the rounding noise in. Take
   it from the field definition, such as the `s` of a SQL Server `decimal(p,s)`.
 - `--scale` rounds the number as the text writes it. A JSON float is written with Python's
-  shortest `repr`, so `1.005` is read as the text `1.005` and rounds to `1.01`, though the binary
-  float nearest to 1.005 is a hair below it. What a database does with that float on conversion is
+  shortest `repr`, or with its written text when the float cannot hold that number, so `1.005` is
+  read as the text `1.005` and rounds to `1.01`, though the binary float nearest to 1.005 is a
+  hair below it. What a database does with that float on conversion is
   not described by the pages I read. A value that lands exactly on a tie can disagree with the
   database. That affects only values that end in a 5 at the place after the scale.
 - `--scale` compares a column when both cells are plain numbers. It does not model a `decimal`
@@ -562,8 +571,9 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - An empty feature set as the target (`features: []`) exits 64 with a columns-not-in-the-file
   error, because there is no header to check the key against. A header-only CSV target is a
   target of 0 rows, so the change rail refuses a first load, and `--force-large` plans it.
-- A JSON integer of more than 4300 digits is reported as not valid JSON and exits 3, because
-  Python limits the digits of an integer it converts from text. A JSON float of that size, or
+- A JSON integer of more than 4300 digits is reported as not valid JSON and exits 3 with
+  Python's own message, which suggests `sys.set_int_max_str_digits()`, a Python call that a command
+  line cannot make. Python limits the digits of an integer it converts from text. A JSON float of that size, or
   one above about 1.8e308, is refused as too large for a binary float, also exit 3.
 - A CSV that starts with a blank line is refused with exit 3 and the message names the blank
   line. A UTF-16 CSV or feature set is refused with exit 3 as not UTF-8. A semicolon CSV exits 64,
@@ -580,8 +590,8 @@ scheduled job that reads only the exit code does not take the held rows for in s
   integer in a shape can raise `OverflowError`. Both exit 70, a fault in the tool, not a finding.
 - A run without `--scale` prints no precision line. It compares cells as exact text, or within
   `--tolerance`.
-- A closed stdout pipe can end the run with exit 70 on some hosts; read the exit code, not the
-  report. A `| head -1` in Git Bash on Windows 3.13.2 gave exit 4 with no traceback, because the
+- A closed stdout pipe, such as a report piped to `head`, can end the run with exit 70 on some
+  hosts. The exit code then reflects the pipe, not the data; read the exit code, not the report. A `| head -1` in Git Bash on Windows 3.13.2 gave exit 4 with no traceback, because the
   output was small.
 - An unclosed CSV quote is reported by the `csv` module. It exits 2 with an error line and no
   `VERDICT` line, while other malformed CSV rows exit 3. A NUL byte depends on the interpreter.
@@ -597,20 +607,25 @@ scheduled job that reads only the exit code does not take the held rows for in s
   `--tolerance` is above 0, because exact text comparison never reaches the numeric path.
 - A key that holds a control character or a terminal escape sequence prints to the console
   unchanged. The exit code and the plan file are not affected, so read the exit code.
-- A JSON number with more than 17 significant digits is parsed to a binary float before `--scale`
-  rounds it or the comparison runs, so digits past the float's precision are lost. For example,
-  `2.6749999999999999999` and the 17-digit `2.6749999999999998` are both read as 2.675 and round to
-  2.68 at scale 2, where the decimal text rounds to 2.67. I found no Esri page that says how many
-  digits a service writes, so do not assume this affects only hand-edited JSON.
+- A CSV saved by Excel whose first line is `sep=,` is read as a one-column header, so `--key` fails
+  with exit 64. It is never read as a clean result.
+- Both refusal kinds print a `VERDICT: REFUSED` line: exit 3 for an input and exit 1 for a rail. A
+  job that matches the text instead of the exit code cannot tell them apart.
+- The stdout and stderr encoding setup runs outside the crash handler, so a stream that fails to
+  reconfigure could end the run with Python's own exit 1, the same number as a rail refusal. I could
+  not trigger it. Read the traceback if a run ends with no `VERDICT` line.
+- Digit separators such as `1_000.5` and non-ASCII digits are not a supported number format. They
+  compare as text, so a column that holds them reads as an update; compare such columns as text.
+- Pyflakes was run on Windows Python 3.13 only. The Ubuntu host has no pyflakes, so the lint was
+  not run there.
 - Only the JSON boolean `true` in `exceededTransferLimit` refuses a file. The string `"true"` is ignored.
 - A repeated attribute name inside one JSON feature keeps the last value, with no warning.
-- The `--apply` write path was verified by the self-test assertions and again by live command
-  lines: a write-flag prefix such as `--ap` or `--apply=1` exits 64 and writes nothing, and a
-  second `--apply` onto an existing plan exits 2 and leaves the first plan unchanged.
+- The `--apply` write path is verified by self-test assertions that run `main()`: a write-flag
+  prefix such as `--ap` or `--apply=1` exits 64 and writes nothing, and a second `--apply` onto an
+  existing plan exits 2 and leaves the first plan unchanged. I did not run `--apply` by hand from a
+  shell.
 - The module docstring's exit-3 list is shorter than the one above. It leaves out a repeated CSV
   column name and a JSON number too large for a binary float.
-- A JSON integer of more than 4300 digits exits 3 with Python's own message, which suggests
-  `sys.set_int_max_str_digits()`. That is a Python call, not something a command line can do.
 - A CSV field of more than 131072 characters exits 2 with `field larger than field limit
   (131072)`. The message does not name the file.
 - An unexpected `ValueError` raised inside the comparison would be reported as exit 64, a usage
@@ -624,8 +639,6 @@ scheduled job that reads only the exit code does not take the held rows for in s
   error only under `--apply`, with exit 2.
 - Line endings inside a quoted field are compared as written, so CRLF against LF is an update.
 - A refusal with exit 3 prints on stdout. Usage and file errors, exit 2 and 64, print on stderr.
-- If stdout is a closed pipe, such as a report piped to `head`, a `BrokenPipeError` can end the
-  run with exit 70. The exit code then reflects the pipe, not the data.
 - The report prints keys as they are and joins a composite key with `|`. A key that holds `|`
   can make two keys print alike, and a key with a newline can print a line such as
   `VERDICT: NO CHANGE` above the real verdict. The plan file keeps each key as a list. Read the
@@ -641,22 +654,17 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - Keys and column names print to stdout and go to the plan file as they appear in the data. Cell
   values are never printed or written. The tool reads no credential and sends no request, but a
   key column that holds sensitive text puts that text in the report and the plan. The plan file is created with the process's default permissions, so anyone who can read it can read every key. Restrict the folder if the keys are sensitive.
-- The Query page's paging example pairs `true` with a pagination token and says paging ends at
-  `false`. It does not say what a `true` means in a file you saved. Treating such a file as the
-  first page only is my reading of it.
 - Build notes only: the 300,000-row timing and the 4000-rows-under-one-key figure are one-off measurements that the
   self-test does not run. A later run took 4.6 seconds for 300,000 rows a side and about 4
   seconds for 4000 rows under one key. A third audit run took about 2 seconds for the 4000-row
   case and 3.7 seconds for the 300,000-row case, so treat all of them as rough.
-- Build notes only: the mutation figures below cannot be reproduced from this repository, because no harness ships.
-  They were measured before `--scale` existed, so the `--scale` code has no mutation figure. Treat
-  them as an old one-off.
 - The Esri documentation shows a failed request as an `error` object with a code and a message,
   but I could not find that on the Query page or the feature service error codes page. The tool
   does not depend on it.
-- Esri's Query page shows `true` with a pagination token and ends paging at `false`. A `true` can
-  also mean the result was cut at the service's maximum record count without paging. Either way
-  the file is partial, so the refusal is right, but applying the page to a saved file is my reading.
+- Esri's Query page pairs `true` with a pagination token and ends paging at `false`. It does not
+  say what a `true` means in a file you saved. A `true` can also mean the result was cut at the
+  service's maximum record count without paging. Either way the file is partial, so the refusal is
+  right, but applying the page to a saved file is my reading.
 - A `--tolerance` run prints only the count of rows it hid as noise, not the tolerance value, so
   the report does not state the tolerance used. Keep the value in your own run log.
 - A scheduled job that reuses one `--out` path exits 2 on its second `--apply` run, because the
@@ -705,16 +713,14 @@ scheduled job that reads only the exit code does not take the held rows for in s
   but a report pasted into a spreadsheet may read such a key as a formula.
 - The plan file is written in place with exclusive creation, not through a temporary file. A
   failed write can leave a partial file, and the exit code is 2.
-- No line is unreachable offline: coverage is 100 percent of lines and branches (1031 statements,
-  210 branches). The tool opens no
+- No line is unreachable offline: coverage is 100 percent of lines and branches (1054 statements,
+  212 branches). The tool opens no
   socket and imports no network module, so it has no network path to stub and no credential in it
   to leak. The self-test asserts that its own source imports no network module.
-- Build note only: a mutation sweep of 519 mutants, run on the revision before the last two fixes, of the code outside the self-test (flipped comparisons, `and`
-  and `or` swaps, forced branches, dropped statements, constants plus one) left 4 alive. They are
-  the `if __name__ == "__main__"` guard and `return _run(argv)` in `main`, each of which makes the
-  script do nothing so the self-test never starts. The self-test kills the other 515.
-  The sweep was not re-run after `--scale` was added, so the new code has the 100 percent
-  branch coverage and its own assertions, but no mutation figure.
+- Build note only, not reproducible: no mutation harness ships. A one-off sweep of 519 mutants
+  left 4 alive, all of them the `if __name__ == "__main__"` guard and `return _run(argv)`. It
+  was measured before `--scale` existed and before the JSON text fix, so that code has 100 percent
+  branch coverage and its own assertions but no mutation figure.
 - The self-test counts the same on all four interpreters. The cp1252 console assertion builds its
   own stream in memory, so it gives the same answer on a host whose console is UTF-8.
 - I read the Esri and Microsoft pages above for the behaviours this README relies on. I did not
@@ -722,7 +728,11 @@ scheduled job that reads only the exit code does not take the held rows for in s
   compared with real delta-table counts. The scale rounding is checked against the rule on the
   pages, not against a database that holds a rounded column.
 - A scale written with a leading zero, such as `V=02`, is read as the plain number 2.
-- The documentation quotes in this README were checked against saved copies of the Esri and Microsoft pages and may have changed since. The statement that the Table Compare page does not mention precision, scale or decimal places was checked the same way, not on a live fetch.
+- The documentation quotes in this README were checked against the live Esri and Microsoft pages
+  when written, and no saved copy ships, so they may have changed since. The statement that the
+  Table Compare page does not mention precision, scale or decimal places was checked the same way.
+- I did not fetch the csvdiff licence, the daff `--id` flag or the links under "Related" when I
+  wrote this. Check them before you rely on them.
 - A dry run whose `--out` names a file that already exists prints `Re-run with --apply`, but the `--apply` run then exits 2, because the plan file is created exclusively. A dry run does not test `--out`.
 - Name an ordinary new file in `--out`. A reserved Windows device name such as `NUL` or `CON` was not tested.
 - A feature set whose `error` value is a string, not an object, is not refused as an error response if it also has a `features` list. Only an `error` object is refused.

@@ -97,10 +97,26 @@ def cell_text(value):
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, float):
-        return repr(value)
+        return _float_text(value)
     if isinstance(value, (dict, list)):
         return json.dumps(value, sort_keys=True)
     return str(value)
+
+
+class _JsonFloat(float):
+    """A float that remembers the JSON text it was parsed from."""
+    text = ""
+
+
+def _float_text(value):
+    """repr of the float, unless that is not the number the JSON file wrote. A float holds about
+    17 digits, so 2.6749999999999998 reads back as 2.675. When the written text differs from
+    the repr as a number, keep the text, so --scale rounds what the service wrote."""
+    shown = repr(value)
+    written = getattr(value, "text", "")
+    if written and decimal.Decimal(written) != decimal.Decimal(shown):
+        return format(decimal.Decimal(written), "f")
+    return shown
 
 
 def to_float(text):
@@ -150,7 +166,8 @@ def geometry_equal(a, b, tolerance):
 def at_scale(text, scale):
     """The number in text rounded half away from zero to scale decimal places, as a Decimal.
     None when text is not a finite plain number. The text is rounded as written, never
-    through a binary float, so 2.675 at scale 2 is 2.68."""
+    through a binary float, so 2.675 at scale 2 is 2.68. A JSON number keeps its written text
+    when a binary float would change it (see _float_text), so that holds for JSON too."""
     if to_float(text) is None:
         return None
     try:
@@ -483,11 +500,13 @@ def read_csv(path):
 def _finite_float(text):
     """json parse_float: refuse a number too large for a binary float. float() would turn it
     into inf, and cell_text would write the text inf, so two different huge values would
-    read as equal."""
+    read as equal. The result keeps the written text for cell_text."""
     number = float(text)
     if not math.isfinite(number):
         raise ValueError("a number too large for a binary float (%d characters)" % len(text))
-    return number
+    kept = _JsonFloat(number)
+    kept.text = text
+    return kept
 
 
 def read_features(path):
@@ -1713,6 +1732,35 @@ def _self_test(tmp):
     code, so, se = run_cli([feat_src, scale_tgt40, "--key", "SEG_ID", "--ignore", "EDITED_ON"])
     check(code == 1 and "40 changed rows exceeds the ceiling of 4" in so,
           "and without --scale the same files are 40 false updates")
+
+    def json_cell(raw):
+        return cell_text(json.loads('{"v": %s}' % raw, parse_float=_finite_float)["v"])
+
+    check(json_cell("2.6749999999999998") == "2.6749999999999998"
+          and json_cell("2.675") == "2.675" and json_cell("2.50") == "2.5"
+          and json_cell("1E5") == "100000.0" and json_cell("-0.1") == "-0.1"
+          and json_cell("1.5e-7") == "1.5e-07" and json_cell("7") == "7",
+          "a JSON float keeps its text only when a binary float would change the number  "
+          "<-- pinned defect")
+    check(at_scale(json_cell("2.6749999999999998"), 2) == D("2.67")
+          and at_scale(json_cell("2.6750000000000001"), 2) == D("2.68"),
+          "a 17-digit JSON value rounds from its text, not from the float's repr  "
+          "<-- pinned defect")
+    tie_rows = [dict(r) for r in feat_rows]
+    tie_json = json.dumps({"features": tie_rows}).replace(
+        "101.50000000000001", "2.6749999999999998")
+    tie_src = make("tie_feat.json", tie_json)
+    tie_csv = lambda v: make("tie_%s.csv" % v, scale_head + scale_row(1, length=v)
+                             + "".join(scale_row(i) for i in range(2, 41)))
+    tie_cmd = lambda tgt: [tie_src, tgt, "--key", "SEG_ID", "--ignore", "EDITED_ON",
+                           "--scale", "LEN_FT=2", "--tolerance", "0"]
+    code, so, se = run_cli(tie_cmd(tie_csv("2.68")))
+    check(code == 0 and "S01  columns LEN_FT" in so and "VERDICT: PLAN READY" in so,
+          "a JSON 2.6749999999999998 against a stored 2.68 is an update, not a false clean  "
+          "<-- pinned defect")
+    code, so, se = run_cli(tie_cmd(tie_csv("2.67")))
+    check(code == 0 and "VERDICT: NO CHANGE" in so,
+          "and against a stored 2.67 it is the same at storage scale")
 
     # ---- the README demo, rebuilt, so the quoted output is exercised
     def seg(i, name=None, length=None, edited="2026-01-01"):
