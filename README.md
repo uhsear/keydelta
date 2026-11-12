@@ -62,6 +62,9 @@ PASS  --ap is refused, not read as a longer flag  <-- pinned defect
 ...
 PASS  --apply never replaces a plan file that exists, and the verdict still prints  <-- pinned defect
 ...
+PASS  a stray character after a closing quote exits 2 with an error line and no verdict
+PASS  a header with a trailing comma names the blank column  <-- pinned defect
+...
 PASS  a refused plan writes no file even with --apply  <-- pinned defect
 ...
 PASS  a CSV that is not UTF-8 is refused with exit 3, not read as NO CHANGE  <-- pinned defect
@@ -94,10 +97,10 @@ PASS  and raises() accepts the exception it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-272 assertions, 0 failed
+274 assertions, 0 failed
 ```
 
-The full run prints all 272 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
+The full run prints all 274 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
 
 ## What already exists
 
@@ -133,11 +136,11 @@ one, a set of buttons, so the name is not taken by another tool for this.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Each snapshot is a CSV, or a saved feature set (`.json`) from a layer query.
 
-The self-test prints the same 272 assertions on Windows (Python 3.13.2 and 3.9.25) and on
+The self-test prints the same 274 assertions on Windows (Python 3.13.2 and 3.9.25) and on
 Ubuntu (Python 3.12.3 and 3.9.25). Windows `py -3.9` finds no interpreter on my machine, so I ran 3.9.25 from a `uv` install
 (`uv python install 3.9`). The four outputs are identical line for line once the Windows
 carriage returns are removed (the same MD5 of the output on all four).
-`coverage run --branch keydelta.py --self-test` reports 100 percent of 1054 statements and 212
+`coverage run --branch keydelta.py --self-test` reports 100 percent of 1058 statements and 212
 branches.
 
 ```
@@ -418,7 +421,7 @@ The tool refuses before it plans, and it refuses a plan it has made.
 - A feature set whose `exceededTransferLimit` is `true`. Esri's query documentation shows a
   paged example response with `"exceededTransferLimit": true` next to a `resultPaginationToken`.
   It says paging continues until the response returns `exceededTransferLimit: false`, which signals
-  that there are no more results to fetch
+  that there are no more pages to fetch
   ([Query](https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/)).
   So a `true` marks a response with more results still to fetch. The page does not discuss a saved
   file, so applying that to one is my reading. A plan from a partial file would delete every row it
@@ -595,8 +598,9 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - A closed stdout pipe, such as a report piped to `head`, can end the run with exit 70 on some
   hosts. The exit code then reflects the pipe, not the data; read the exit code, not the report. A `| head -1` in Git Bash on Windows 3.13.2 gave exit 4 with no traceback, because the
   output was small.
-- An unclosed CSV quote is reported by the `csv` module. It exits 2 with an error line and no
-  `VERDICT` line, while other malformed CSV rows exit 3. A NUL byte depends on the interpreter.
+- A malformed CSV quote, such as an unclosed quote or text after a closing quote, is reported by
+  the `csv` module. It exits 2 with an error line and no `VERDICT` line. A row with the wrong
+  number of fields is a different case and exits 3. A NUL byte depends on the interpreter.
   Python 3.9.25 raises `line contains NUL` and the run exits 2. Python 3.12 and 3.13 read the
   NUL as ordinary data, so the run compares it and ends with a normal `VERDICT`. I measured
   3.9.25, 3.12.3 and 3.13.2 only, and I did not find the version that changed this.
@@ -715,10 +719,27 @@ scheduled job that reads only the exit code does not take the held rows for in s
   but a report pasted into a spreadsheet may read such a key as a formula.
 - The plan file is written in place with exclusive creation, not through a temporary file. A
   failed write can leave a partial file, and the exit code is 2.
-- No line is unreachable offline: coverage is 100 percent of lines and branches (1054 statements,
+- No line is unreachable offline: coverage is 100 percent of lines and branches (1058 statements,
   212 branches). The tool opens no
   socket and imports no network module, so it has no network path to stub and no credential in it
-  to leak. The self-test asserts that its own source imports no network module.
+  to leak. The self-test asserts that its own source imports none of 13 named network modules:
+  `socket`, `urllib`, `http`, `ssl`, `requests`, `ftplib`, `smtplib`, `asyncio`, `xmlrpc`,
+  `socketserver`, `imaplib`, `poplib` and `telnetlib`. A module outside that list would pass.
+- The self-test writes temporary files under the system temp directory, and the banner says so.
+  That is the only write besides `--apply`, so "nothing else writes" means nothing else writes
+  outside that temporary directory.
+- `--scale` is a flag you set per column. The tool does not read a scale from a layer definition
+  or a database. This is my reading of "declared storage scale": Esri's REST field JSON, as I read
+  it, carries a field type and a length but no scale.
+- A SOURCE, TARGET or `--out` given as a UNC path (for example `\\host\share\file`) makes the operating
+  system contact that host. "Sends no request" means the tool opens no socket and never follows a
+  URL from data, not that a network path you type is never touched.
+- A CSV cell of more than 4300 digits, on Python 3.11 and later, cannot reach the exact integer
+  compare, because `float()` turns it into `inf` and it compares as text. I found no crash, and
+  no assertion covers this.
+- A key from untrusted data can hold escape characters that move the cursor or recolour the
+  console. Read the plan file, not the console, when the keys are not yours.
+- The self-test count is 274 on Windows 3.13.2 and 3.9.25 and on Ubuntu 3.12.3 and 3.9.25.
 - Build note only, not reproducible: no mutation harness ships. A one-off sweep of 519 mutants
   left 4 alive, all of them the `if __name__ == "__main__"` guard and `return _run(argv)`. It
   was measured before `--scale` existed and before the JSON text fix, so that code has 100 percent
@@ -733,8 +754,6 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - The documentation quotes in this README were checked against the live Esri and Microsoft pages
   when written, and no saved copy ships, so they may have changed since. The statement that the
   Table Compare page does not mention precision, scale or decimal places was checked the same way.
-- I did not fetch the csvdiff licence, the daff `--id` flag or the links under "Related" when I
-  wrote this. Check them before you rely on them.
 - A dry run whose `--out` names a file that already exists prints `Re-run with --apply`, but the `--apply` run then exits 2, because the plan file is created exclusively. A dry run does not test `--out`.
 - Name an ordinary new file in `--out`. A reserved Windows device name such as `NUL` or `CON` was not tested.
 - A feature set whose `error` value is a string, not an object, is not refused as an error response if it also has a `features` list. Only an `error` object is refused.

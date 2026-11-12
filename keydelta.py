@@ -584,7 +584,7 @@ def compare_columns(src_header, tgt_header, keys, ignore):
         diff = sorted(set(src_cols) ^ set(tgt_cols))
         raise ValueError(
             "the two files do not hold the same columns. Only on one side: %s. Name them with "
-            "--ignore or fix the export." % ", ".join(diff))
+            "--ignore or fix the export." % ", ".join(c or "(blank column name)" for c in diff))
     if not src_cols:
         raise ValueError("no column is left to compare after the key and --ignore.")
     return src_cols
@@ -1300,6 +1300,14 @@ def _self_test(tmp):
           "and the report prices the saving: 0 delta rows against 80")
     code, so, se = run_cli([src, tgt, "--key", "SEG"])
     check(code == 1 and "REFUSED" in so, "without --ignore every row differs and a rail refuses")
+    code, so, se = run_cli([make("stray.csv", 'ID,V\n1,"abc"def\n2,b\n'),
+                            make("plain.csv", "ID,V\n1,a\n2,b\n"), "--key", "ID"])
+    check(code == 2 and "VERDICT" not in so and se.startswith("error:"),
+          "a stray character after a closing quote exits 2 with an error line and no verdict")
+    code, so, se = run_cli([make("trail.csv", "ID,V,\n1,a,\n"), make("plain2.csv", "ID,V\n1,a\n"),
+                            "--key", "ID"])
+    check(code == 64 and "(blank column name)" in se,
+          "a header with a trailing comma names the blank column  <-- pinned defect")
 
     def line(i, name=None, edited="2025-12-31"):
         return "S%02d,%s,%d.5,%s\n" % (i, name or "Road %02d" % i, i, edited)
@@ -1864,12 +1872,14 @@ def _self_test(tmp):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 names = [a.name for a in node.names] + [getattr(node, "module", None) or ""]
                 found.update(n.split(".")[0] for n in names)
-        return found & {"socket", "urllib", "http", "ssl", "requests", "ftplib", "smtplib"}
+        return found & {"socket", "urllib", "http", "ssl", "requests", "ftplib", "smtplib",
+                        "asyncio", "xmlrpc", "socketserver", "imaplib", "poplib", "telnetlib"}
 
     check(network_imports(code_text) == set(),
           "the source imports no network module")
     check(network_imports("from urllib.request import urlopen") == {"urllib"}
           and network_imports("import http.client") == {"http"}
+          and network_imports("import asyncio, xmlrpc.client") == {"asyncio", "xmlrpc"}
           and network_imports("import os") == set(),
           "and the check sees the from form and a dotted import  <-- pinned defect")
     check(all(ord(ch) < 128 for ch in code_text), "the source is pure ASCII")
