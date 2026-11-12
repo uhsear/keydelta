@@ -548,8 +548,10 @@ scheduled job that reads only the exit code does not take the held rows for in s
   percent is 0 rows, so one delete is refused. Raise `--max-delete` for a small table.
 - The source rows must be complete. The tool can see a truncated feature set only through
   `exceededTransferLimit`. A response cut at the maximum record count by a server that sets no
-  such flag looks complete, so compare its row count with the layer's record count first. A CSV cut off by a failed export looks like a smaller table, and the
-  delete rail is what stops it.
+  such flag looks complete, so compare its row count with the layer's record count first. A CSV cut off by a failed export looks like a smaller table. The delete rail stops it only when
+  the cut removes more rows than `--max-delete` allows. A cut of 2 percent or less passes every rail, prints
+  `PLAN READY` with the deletes and exits 0, because the tool cannot tell a cut from a real removal.
+  Lower `--max-delete` or compare the row counts before you apply.
 - Only UTF-8 input is supported. A CSV or feature set with a byte that is not valid UTF-8, such as
   a CSV that Excel saved in cp1252, is refused with exit 3 and the file name, so two different
   accented letters cannot both turn into one replacement character and hide an edit. Save it as
@@ -737,6 +739,13 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - Name an ordinary new file in `--out`. A reserved Windows device name such as `NUL` or `CON` was not tested.
 - A feature set whose `error` value is a string, not an object, is not refused as an error response if it also has a `features` list. Only an `error` object is refused.
 - SOURCE and TARGET may name the same file with no warning. The run reports NO CHANGE.
+- The report prints every source and target line number of a held-back key on one line, and `--sample` caps keys, not these lists. A key with thousands of rows can print thousands of numbers.
+- A source feature set with no features, run with `--min-rows 0` against a CSV target, exits 64 with a columns-not-in-the-file error for the source. The real cause is the empty feature set.
+- An unclosed CSV quote exits 2 with `error: unexpected end of data`. The message does not name the file or the line.
+- A file name is printed as typed in the header and in error messages. Pass plain file paths, not a path or URL that carries a secret.
+- Ctrl-C is not handled. Python ends the process with its own interrupt exit code and a traceback. Treat any exit code that is not in the table as a failed run.
+- The report counts a rounded single-row key under both "unchanged" and "same at storage scale". The two counts overlap, so do not add them.
+- An existing `--out` path fails at write time with `File exists`. Name a new file.
 
 ## Contributing
 
