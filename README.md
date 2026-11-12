@@ -407,13 +407,14 @@ The tool refuses before it plans, and it refuses a plan it has made.
 - A CSV row whose field count differs from the header. A cell beyond the header would be dropped, so
   a real edit in it would show as `NO CHANGE`. The row is refused with its line number, exit 3.
 - A source with fewer rows than `--min-rows`. An empty source plans to delete the target.
-- A feature set whose `exceededTransferLimit` is `true`. Esri's query documentation says there are
-  no more pages to fetch when `exceededTransferLimit: false` is present
+- A feature set whose `exceededTransferLimit` is `true`. Esri's query documentation shows a
+  paged example response with `"exceededTransferLimit": true` next to a `resultPaginationToken`.
+  It says paging continues until the response returns `exceededTransferLimit: false`, which signals
+  that there are no more results to fetch
   ([Query](https://developers.arcgis.com/rest/services-reference/enterprise/query-feature-service-layer/)).
-  It mentions `true` only in the `returnExceededLimitFeatures` parameter, which says features are
-  returned even when the results include `exceededTransferLimit` as `true`. It does not say what a
-  `true` means for a saved file. Reading it as "the file holds a partial page" is my inference.
-  A plan from a partial file would delete every row it did not return, so the tool refuses it.
+  So a `true` marks a response with more results still to fetch. The page does not discuss a saved
+  file, so applying that to one is my reading. A plan from a partial file would delete every row it
+  did not return, so the tool refuses it.
 - A JSON number too large for a binary float, such as `1e400` or a float of 5000 digits. Python
   reads it as `inf`, and two different huge values would then print as the same text and show as
   `NO CHANGE`. The file is refused, exit 3.
@@ -640,8 +641,9 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - Keys and column names print to stdout and go to the plan file as they appear in the data. Cell
   values are never printed or written. The tool reads no credential and sends no request, but a
   key column that holds sensitive text puts that text in the report and the plan. The plan file is created with the process's default permissions, so anyone who can read it can read every key. Restrict the folder if the keys are sensitive.
-- The Query page supports "false means no more pages" directly. That a `true` means the file holds
-  the first page only is my inference from it, which the page does not state.
+- The Query page's paging example pairs `true` with a pagination token and says paging ends at
+  `false`. It does not say what a `true` means in a file you saved. Treating such a file as the
+  first page only is my reading of it.
 - Build notes only: the 300,000-row timing and the 4000-rows-under-one-key figure are one-off measurements that the
   self-test does not run. A later run took 4.6 seconds for 300,000 rows a side and about 4
   seconds for 4000 rows under one key. A third audit run took about 2 seconds for the 4000-row
@@ -652,10 +654,9 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - The Esri documentation shows a failed request as an `error` object with a code and a message,
   but I could not find that on the Query page or the feature service error codes page. The tool
   does not depend on it.
-- Esri's Query page defines the `false` case of `exceededTransferLimit` for paging. It does not
-  define a `true` in a saved file. A `true` can also mean
-  the result was cut at the service's maximum record count without paging. Either way the file is
-  partial, so the refusal is right, but the reading is an inference.
+- Esri's Query page shows `true` with a pagination token and ends paging at `false`. A `true` can
+  also mean the result was cut at the service's maximum record count without paging. Either way
+  the file is partial, so the refusal is right, but applying the page to a saved file is my reading.
 - A `--tolerance` run prints only the count of rows it hid as noise, not the tolerance value, so
   the report does not state the tolerance used. Keep the value in your own run log.
 - A scheduled job that reuses one `--out` path exits 2 on its second `--apply` run, because the
