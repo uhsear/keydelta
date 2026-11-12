@@ -44,6 +44,8 @@ PASS  a JSON null reads as blank and a boolean as true or false
 ...
 PASS  nan and inf are text, never a number to subtract  <-- pinned defect
 ...
+PASS  long integers above 2**53 are subtracted exactly, not as floats  <-- pinned defect
+...
 PASS  a key two source rows share is held back, with the rows named  <-- pinned defect
 PASS  the held key is not inserted, updated or deleted, so the published row stays  <-- pinned defect
 ...
@@ -88,10 +90,10 @@ PASS  and raises() accepts the exception it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-267 assertions, 0 failed
+268 assertions, 0 failed
 ```
 
-The full run prints all 267 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
+The full run prints all 268 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
 
 ## What already exists
 
@@ -127,10 +129,10 @@ one, a set of buttons, so the name is not taken by another tool for this.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Each snapshot is a CSV, or a saved feature set (`.json`) from a layer query.
 
-The self-test prints the same 267 assertions on Windows (Python 3.13.2 and 3.9.25) and on
+The self-test prints the same 268 assertions on Windows (Python 3.13.2 and 3.9.25) and on
 Ubuntu (Python 3.12.3 and 3.9.25). The four outputs are identical line for line once the Windows
 carriage returns are removed (the same MD5 of the output on all four).
-`coverage run --branch keydelta.py --self-test` reports 100 percent of 1027 statements and 208
+`coverage run --branch keydelta.py --self-test` reports 100 percent of 1031 statements and 210
 branches.
 
 ```
@@ -583,8 +585,8 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - An unclosed CSV quote is reported by the `csv` module. It exits 2 with an error line and no
   `VERDICT` line, while other malformed CSV rows exit 3. A NUL byte depends on the interpreter.
   Python 3.9.25 raises `line contains NUL` and the run exits 2. Python 3.12 and 3.13 read the
-  NUL as ordinary data, so the run compares it and ends with a normal `VERDICT`. The `csv` module
-  changelog places that change at 3.11; I measured 3.9.25, 3.12.3 and 3.13.2 only.
+  NUL as ordinary data, so the run compares it and ends with a normal `VERDICT`. I measured
+  3.9.25, 3.12.3 and 3.13.2 only, and I did not find the version that changed this.
 - A JSON `NaN` or `Infinity` literal is read as the text `nan` or `inf`, so it compares equal to
   the same text in a CSV. Esri does not emit these literals.
 - A blank line between CSV data rows is skipped without a refusal.
@@ -666,6 +668,18 @@ scheduled job that reads only the exit code does not take the held rows for in s
   output can be reproduced only through it, not by running the four files on separate tables.
 - The GitHub name search under "What already exists" has no recorded date. Repeat it before you
   rely on it.
+- The tool picks the input format from the file name alone. A path ending in `.json`, in any
+  case, is read as a feature set and every other path as a CSV. A feature set saved as
+  `response.txt` is read as CSV and ends in a column or field-count error (exit 64 or 3), never a
+  false clean. A CSV named `x.json` is refused as invalid JSON (exit 3).
+- A killed or interrupted `--self-test` run can leave a `keydelta-selftest` directory in the
+  system temporary directory, because cleanup runs in a `finally` block that a killed process
+  never reaches.
+- Under `--scale`, a number beyond about 1.8e308, or one with a 19-digit exponent, is compared as
+  text, so two such values that round to the same stored value still read as an update.
+- Under `--tolerance`, two integer texts are subtracted exactly, so a 17 to 19 digit ID that
+  differs by 1 is an update. An integer against a decimal text, such as `12345678901234568` against
+  `12345678901234567.0`, still goes through a binary float and can read as noise.
 - Branch coverage was measured on Windows with Python 3.13.2. It was not measured on Linux,
   where `coverage` is not installed.
 - A plan with changes and held-back keys prints `PLAN READY` and exits 4. The plan is ready for
@@ -690,8 +704,8 @@ scheduled job that reads only the exit code does not take the held rows for in s
   but a report pasted into a spreadsheet may read such a key as a formula.
 - The plan file is written in place with exclusive creation, not through a temporary file. A
   failed write can leave a partial file, and the exit code is 2.
-- No line is unreachable offline: coverage is 100 percent of lines and branches (1027 statements,
-  208 branches). The tool opens no
+- No line is unreachable offline: coverage is 100 percent of lines and branches (1031 statements,
+  210 branches). The tool opens no
   socket and imports no network module, so it has no network path to stub and no credential in it
   to leak. The self-test asserts that its own source imports no network module.
 - Build note only: a mutation sweep of 519 mutants, run on the revision before the last two fixes, of the code outside the self-test (flipped comparisons, `and`

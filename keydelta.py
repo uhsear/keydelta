@@ -72,6 +72,7 @@ GEOM_COL = "@geometry"
 # hex, no nan or inf. float() alone accepts all of those.
 PLAIN_NUMBER = re.compile(r"[+-]?(0|[1-9][0-9]*)(\.[0-9]*)?([eE][+-]?[0-9]+)?\Z|"
                           r"[+-]?\.[0-9]+([eE][+-]?[0-9]+)?\Z")
+INTEGER_TEXT = re.compile(r"[+-]?[0-9]+\Z")
 
 
 # The most decimal places a SQL Server decimal or numeric column can store (precision 38).
@@ -118,6 +119,9 @@ def values_equal(a, b, tolerance):
     if tolerance > 0:
         x, y = to_float(a), to_float(b)
         if x is not None and y is not None:
+            if INTEGER_TEXT.match(a) and INTEGER_TEXT.match(b):
+                # Integers above 2**53 collapse to one float, so subtract them exactly.
+                x, y = int(a), int(b)
             return abs(x - y) <= tolerance
     return False
 
@@ -900,6 +904,10 @@ def _self_test(tmp):
           "a difference exactly at the tolerance is equal, the limit is inclusive")
     check(not values_equal("abc", "1", 0.5) and not values_equal("nan", "1", 0.5),
           "text and nan never pass a tolerance")
+    check(not values_equal("12345678901234568", "12345678901234567", 0.01)
+          and values_equal("12345678901234568", "12345678901234567", 1)
+          and not values_equal("12345678901234568", "12345678901234566", 1.5),
+          "long integers above 2**53 are subtracted exactly, not as floats  <-- pinned defect")
 
     # ---- differing
     changed, noisy = differing({"A": "1", "B": "x"}, {"A": "1", "B": "y"}, ["A", "B"], 0)
