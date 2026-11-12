@@ -60,10 +60,10 @@ PASS  refused: 1e400 read as inf  <-- pinned defect
 ...
 PASS  --ap is refused, not read as a longer flag  <-- pinned defect
 ...
-PASS  --apply never replaces a plan file that exists, and the verdict still prints  <-- pinned defect
-...
 PASS  a stray character after a closing quote exits 2 with an error line and no verdict
 PASS  a header with a trailing comma names the blank column  <-- pinned defect
+...
+PASS  --apply never replaces a plan file that exists, and the verdict still prints  <-- pinned defect
 ...
 PASS  a refused plan writes no file even with --apply  <-- pinned defect
 ...
@@ -97,10 +97,10 @@ PASS  and raises() accepts the exception it is looking for
 PASS  the footer reports failures by count and by name, and exits 1  <-- pinned defect
 PASS  importing the module prints nothing and exposes the core
 --------------------------------------------------------------------
-274 assertions, 0 failed
+275 assertions, 0 failed
 ```
 
-The full run prints all 274 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
+The full run prints all 275 assertions. This block is a selection of its lines in run order, and each `...` line marks where lines of the run are left out.
 
 ## What already exists
 
@@ -136,11 +136,11 @@ one, a set of buttons, so the name is not taken by another tool for this.
 Python 3.9 or newer and nothing else. No `arcpy`, no third-party package, no network, no
 database. Each snapshot is a CSV, or a saved feature set (`.json`) from a layer query.
 
-The self-test prints the same 274 assertions on Windows (Python 3.13.2 and 3.9.25) and on
+The self-test prints the same 275 assertions on Windows (Python 3.13.2 and 3.9.25) and on
 Ubuntu (Python 3.12.3 and 3.9.25). Windows `py -3.9` finds no interpreter on my machine, so I ran 3.9.25 from a `uv` install
 (`uv python install 3.9`). The four outputs are identical line for line once the Windows
 carriage returns are removed (the same MD5 of the output on all four).
-`coverage run --branch keydelta.py --self-test` reports 100 percent of 1058 statements and 212
+`coverage run --branch keydelta.py --self-test` reports 100 percent of 1068 statements and 216
 branches.
 
 ```
@@ -589,7 +589,7 @@ scheduled job that reads only the exit code does not take the held rows for in s
   first.
 - A group of N rows under one key is compared in time that grows with N squared. With a
   low-cardinality column as `--key` and the two files in different orders, 4000 rows under one
-  key took about 4 seconds here, and tens of thousands would run for minutes before any rail can
+  key took 4 to 6 seconds here, and tens of thousands would run for minutes before any rail can
   fire. Use a real key.
 - A JSON file nested hundreds of thousands of levels deep raises `RecursionError`, and a huge
   integer in a shape can raise `OverflowError`. Both exit 70, a fault in the tool, not a finding.
@@ -628,8 +628,9 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - A repeated attribute name inside one JSON feature keeps the last value, with no warning.
 - The `--apply` write path is verified by self-test assertions that run `main()`: a write-flag
   prefix such as `--ap` or `--apply=1` exits 64 and writes nothing, and a second `--apply` onto an
-  existing plan exits 2 and leaves the first plan unchanged. I did not run `--apply` by hand from a
-  shell.
+  existing plan exits 2 and leaves the first plan unchanged. I also ran `--apply` by hand
+  from a shell: the first run wrote the plan and exited 0, and a second run onto the same path exited 2 with `File exists`.
+  Only the exit codes and the file contents were checked, not the console encoding.
 - The module docstring's exit-3 list is shorter than the one above. It leaves out a repeated CSV
   column name and a JSON number too large for a binary float.
 - A CSV field of more than 131072 characters exits 2 with `field larger than field limit
@@ -640,7 +641,10 @@ scheduled job that reads only the exit code does not take the held rows for in s
   refuses a single edit with exit 1. Raise `--max-change` for a table that small.
 - A number with an exponent of 19 digits or more, such as `1e-9999999999999999999`, is beyond the
   range of the decimal context that `--scale` rounds in. It is compared as text, so two such
-  numbers that differ show as an update. An exponent of 18 digits rounds normally.
+  numbers that differ show as an update. An exponent of 18 digits rounds normally. That is for a
+  CSV cell. A JSON float with such an exponent, or with one beyond 1000 either way, has already
+  become 0.0 in the binary float, so it is read as the repr `0.0`. Two such values read as equal
+  to each other, and to a `0.0` cell, and the run does not crash.
 - A dry run does not test whether `--out` can be created. A path in a missing directory shows its
   error only under `--apply`, with exit 2.
 - Line endings inside a quoted field are compared as written, so CRLF against LF is an update.
@@ -690,7 +694,7 @@ scheduled job that reads only the exit code does not take the held rows for in s
 - A killed or interrupted `--self-test` run can leave a `keydelta-selftest` directory in the
   system temporary directory, because cleanup runs in a `finally` block that a killed process
   never reaches.
-- Under `--scale`, a number beyond about 1.8e308, or one with a 19-digit exponent, is compared as
+- Under `--scale`, a CSV number beyond about 1.8e308, or one with a 19-digit exponent, is compared as
   text, so two such values that round to the same stored value still read as an update.
 - Under `--tolerance`, two integer texts are subtracted exactly, so a 17 to 19 digit ID that
   differs by 1 is an update. An integer against a decimal text, such as `12345678901234568` against
@@ -719,8 +723,8 @@ scheduled job that reads only the exit code does not take the held rows for in s
   but a report pasted into a spreadsheet may read such a key as a formula.
 - The plan file is written in place with exclusive creation, not through a temporary file. A
   failed write can leave a partial file, and the exit code is 2.
-- No line is unreachable offline: coverage is 100 percent of lines and branches (1058 statements,
-  212 branches). The tool opens no
+- No line is unreachable offline: coverage is 100 percent of lines and branches (1068 statements,
+  216 branches). The tool opens no
   socket and imports no network module, so it has no network path to stub and no credential in it
   to leak. The self-test asserts that its own source imports none of 13 named network modules:
   `socket`, `urllib`, `http`, `ssl`, `requests`, `ftplib`, `smtplib`, `asyncio`, `xmlrpc`,
@@ -739,7 +743,7 @@ scheduled job that reads only the exit code does not take the held rows for in s
   no assertion covers this.
 - A key from untrusted data can hold escape characters that move the cursor or recolour the
   console. Read the plan file, not the console, when the keys are not yours.
-- The self-test count is 274 on Windows 3.13.2 and 3.9.25 and on Ubuntu 3.12.3 and 3.9.25.
+- The self-test count is 275 on Windows 3.13.2 and 3.9.25 and on Ubuntu 3.12.3 and 3.9.25.
 - Build note only, not reproducible: no mutation harness ships. A one-off sweep of 519 mutants
   left 4 alive, all of them the `if __name__ == "__main__"` guard and `return _run(argv)`. It
   was measured before `--scale` existed and before the JSON text fix, so that code has 100 percent
@@ -755,7 +759,14 @@ scheduled job that reads only the exit code does not take the held rows for in s
   when written, and no saved copy ships, so they may have changed since. The statement that the
   Table Compare page does not mention precision, scale or decimal places was checked the same way.
 - A dry run whose `--out` names a file that already exists prints `Re-run with --apply`, but the `--apply` run then exits 2, because the plan file is created exclusively. A dry run does not test `--out`.
-- Name an ordinary new file in `--out`. A reserved Windows device name such as `NUL` or `CON` was not tested.
+- Name an ordinary new file in `--out`. A reserved Windows device name passes the
+  exclusive-create check. `--out NUL --apply` prints `wrote NUL` and exits 0 with no plan stored. `--out CON --apply` ends the run
+  with exit 70, a fault in the tool, not a finding.
+- A plan file that a job reads next should be checked to parse as JSON first, because a write that
+  fails midway, such as a full disk, leaves a partial file.
+- The 0 to 38 range of `--scale` comes from the SQL Server `decimal` type. The Esri Add Field page
+  describes Field Scale as applicable only to float or double fields and does not give that range.
+  The range is a rule the tool applies, not one the Esri page states.
 - A feature set whose `error` value is a string, not an object, is not refused as an error response if it also has a `features` list. Only an `error` object is refused.
 - SOURCE and TARGET may name the same file with no warning. The run reports NO CHANGE.
 - The report prints every source and target line number of a held-back key on one line, and `--sample` caps keys, not these lists. A key with thousands of rows can print thousands of numbers.

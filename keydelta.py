@@ -80,6 +80,8 @@ MAX_SCALE = 38
 # Ties round half away from zero. 400 digits holds any finite float (309 digits) plus 38 places.
 SCALE_CONTEXT = decimal.Context(prec=400, rounding=decimal.ROUND_HALF_UP)
 SCALE_SPEC = re.compile(r"[0-9]{1,2}\Z")
+# A JSON float written with a larger exponent than this keeps its repr, not its spelled-out digits.
+MAX_TEXT_EXPONENT = 1000
 
 
 class InputRefused(Exception):
@@ -114,8 +116,19 @@ def _float_text(value):
     the repr as a number, keep the text, so --scale rounds what the service wrote."""
     shown = repr(value)
     written = getattr(value, "text", "")
-    if written and decimal.Decimal(written) != decimal.Decimal(shown):
-        return format(decimal.Decimal(written), "f")
+    if not written:
+        return shown
+    try:
+        exact = decimal.Decimal(written)
+    except decimal.InvalidOperation:
+        # An exponent of 19 digits or more is beyond the decimal context. The float is 0.0
+        # or inf by then, so the repr is the only text left.
+        return shown
+    if abs(exact.adjusted()) > MAX_TEXT_EXPONENT:
+        # Spelling 1e-999999999999 out as digits would build a string of that many characters.
+        return shown
+    if exact != decimal.Decimal(shown):
+        return format(exact, "f")
     return shown
 
 
@@ -1753,6 +1766,10 @@ def _self_test(tmp):
     check(at_scale(json_cell("2.6749999999999998"), 2) == D("2.67")
           and at_scale(json_cell("2.6750000000000001"), 2) == D("2.68"),
           "a 17-digit JSON value rounds from its text, not from the float's repr  "
+          "<-- pinned defect")
+    check(json_cell("1e-9999999999999999999") == "0.0" and json_cell("1e-999999999999") == "0.0"
+          and json_cell("1e-5000") == "0.0" and json_cell("1e-400") == "0." + "0" * 399 + "1",
+          "a JSON float with a huge exponent reads as its repr, not a crash or a giant string  "
           "<-- pinned defect")
     tie_rows = [dict(r) for r in feat_rows]
     tie_json = json.dumps({"features": tie_rows}).replace(
